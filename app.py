@@ -4,12 +4,12 @@ Backend API dla wyceny tras transportowych na podstawie kodów pocztowych
 """
 
 from flask import Flask, jsonify, request
+from functools import wraps
 import os
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Dict, Any, Optional
-from datetime import datetime
 
 app = Flask(__name__)
 
@@ -31,8 +31,6 @@ _POSTAL_MAPPING_TIMOCOM = None
 
 def require_api_key(f):
     """Decorator sprawdzający API key w headerze X-API-Key"""
-    from functools import wraps
-    
     @wraps(f)
     def decorated_function(*args, **kwargs):
         # Jeśli nie wymaga API key, pomiń sprawdzanie
