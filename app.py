@@ -4,14 +4,34 @@ Backend API dla wyceny tras transportowych na podstawie kodów pocztowych
 """
 
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import Dict, Any, Optional
 from datetime import datetime
+import secrets
+import logging
+import re
 
 app = Flask(__name__)
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Konfiguracja rate limiting
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
 
 # Konfiguracja bazy danych PostgreSQL
 DB_HOST = os.getenv("POSTGRES_HOST")
@@ -28,6 +48,9 @@ REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "true").lower() == "true"
 _POSTAL_MAPPING_TRANSEU = None
 _POSTAL_MAPPING_TIMOCOM = None
 
+# Regex dla walidacji kodów pocztowych (2 litery + 2+ cyfry lub tylko cyfry)
+POSTAL_CODE_PATTERN = re.compile(r'^([A-Z]{2}\d{2,}|\d{2,})$', re.IGNORECASE)
+
 
 def require_api_key(f):
     """Decorator sprawdzający API key w headerze X-API-Key"""
@@ -41,23 +64,27 @@ def require_api_key(f):
         
         # Jeśli brak skonfigurowanego API key, ostrzeżenie
         if not API_KEY:
-            print("⚠️ UWAGA: API_KEY nie jest skonfigurowany, ale REQUIRE_API_KEY=true!")
+            logger.error("API_KEY not configured but REQUIRE_API_KEY=true")
             return jsonify({
                 'success': False,
                 'error': 'API nie jest poprawnie skonfigurowane'
             }), 500
-        
+
         # Sprawdź API key w headerze
         provided_key = request.headers.get('X-API-Key')
-        
+
         if not provided_key:
             return jsonify({
                 'success': False,
                 'error': 'Brak API key. Wymagany header: X-API-Key'
             }), 401
-        
-        if provided_key != API_KEY:
-            print(f"⚠️ Nieautoryzowana próba dostępu z IP: {request.remote_addr}")
+
+        # Użyj secrets.compare_digest() aby zapobiec timing attacks
+        if not secrets.compare_digest(provided_key, API_KEY):
+            logger.warning(
+                "Unauthorized API access attempt",
+                extra={'ip': request.remote_addr, 'endpoint': request.path}
+            )
             return jsonify({
                 'success': False,
                 'error': 'Nieprawidłowy API key'
@@ -67,6 +94,17 @@ def require_api_key(f):
         return f(*args, **kwargs)
     
     return decorated_function
+
+
+@app.after_request
+def set_security_headers(response):
+    """Dodaje nagłówki bezpieczeństwa do wszystkich odpowiedzi"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    return response
 
 
 @app.route('/')
@@ -92,9 +130,9 @@ def health():
 def _get_db_connection():
     """Nawiązuje połączenie z bazą danych PostgreSQL"""
     if not all([DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME]):
-        print("⚠ Ostrzeżenie: Brak pełnej konfiguracji bazy danych")
+        logger.warning("Incomplete database configuration")
         return None
-    
+
     try:
         return psycopg2.connect(
             host=DB_HOST,
@@ -105,32 +143,41 @@ def _get_db_connection():
             cursor_factory=RealDictCursor,
         )
     except Exception as exc:
-        print(f"❌ Błąd połączenia z bazą danych: {exc}")
+        logger.error(f"Database connection error: {exc}")
         return None
 
 
 def _load_postal_mappings():
     """Ładuje mapowania kodów pocztowych na region IDs"""
     global _POSTAL_MAPPING_TRANSEU, _POSTAL_MAPPING_TIMOCOM
-    
+
     if _POSTAL_MAPPING_TRANSEU is None or _POSTAL_MAPPING_TIMOCOM is None:
         try:
             transeu_path = os.path.join(os.path.dirname(__file__), 'data', 'postal_code_to_region_transeu.json')
             timocom_path = os.path.join(os.path.dirname(__file__), 'data', 'postal_code_to_region_timocom.json')
-            
+
             with open(transeu_path, 'r', encoding='utf-8') as f:
                 _POSTAL_MAPPING_TRANSEU = json.load(f)
-            
+
             with open(timocom_path, 'r', encoding='utf-8') as f:
                 _POSTAL_MAPPING_TIMOCOM = json.load(f)
-            
-            print(f"✓ Załadowano mapowania: Trans.eu ({len(_POSTAL_MAPPING_TRANSEU)} kodów), TimoCom ({len(_POSTAL_MAPPING_TIMOCOM)} kodów)")
+
+            logger.info(f"Loaded postal mappings: Trans.eu ({len(_POSTAL_MAPPING_TRANSEU)} codes), TimoCom ({len(_POSTAL_MAPPING_TIMOCOM)} codes)")
         except Exception as e:
-            print(f"❌ Błąd ładowania mapowań: {e}")
+            logger.error(f"Error loading postal mappings: {e}")
             _POSTAL_MAPPING_TRANSEU = {}
             _POSTAL_MAPPING_TIMOCOM = {}
-    
+
     return _POSTAL_MAPPING_TRANSEU, _POSTAL_MAPPING_TIMOCOM
+
+
+def _validate_postal_code(postal_code: str) -> bool:
+    """Waliduje format kodu pocztowego"""
+    if not postal_code or len(postal_code) < 2:
+        return False
+    # Usuń spacje i myślniki przed walidacją
+    clean = postal_code.replace(' ', '').replace('-', '')
+    return bool(POSTAL_CODE_PATTERN.match(clean))
 
 
 def _normalize_postal_code(postal_code: str) -> str:
@@ -224,18 +271,19 @@ def _get_pricing_from_db(start_region_id: int, end_region_id: int, vehicle_type:
             'source': config['source'],
             'pricing': pricing_data
         }
-        
+
     except Exception as e:
-        print(f"❌ Błąd zapytania do bazy: {e}")
+        logger.error(f"Database query error: {e}", exc_info=True)
         return {
             'success': False,
-            'error': f'Błąd zapytania do bazy: {str(e)}'
+            'error': 'Błąd zapytania do bazy danych'
         }
     finally:
         conn.close()
 
 
 @app.route('/api/route-pricing', methods=['POST'])
+@limiter.limit("10 per minute")
 @require_api_key
 def get_route_pricing():
     """
@@ -278,7 +326,22 @@ def get_route_pricing():
                 'success': False,
                 'error': 'Brak kodów pocztowych (start_postal_code i end_postal_code wymagane)'
             }), 400
-        
+
+        # Walidacja formatów kodów pocztowych
+        if not _validate_postal_code(start_postal):
+            return jsonify({
+                'success': False,
+                'error': f'Nieprawidłowy format kodu pocztowego: {start_postal}',
+                'hint': 'Użyj formatu: [KRAJ][2_CYFRY], np. PL50, DE10, lub same cyfry: 50'
+            }), 400
+
+        if not _validate_postal_code(end_postal):
+            return jsonify({
+                'success': False,
+                'error': f'Nieprawidłowy format kodu pocztowego: {end_postal}',
+                'hint': 'Użyj formatu: [KRAJ][2_CYFRY], np. PL50, DE10, lub same cyfry: 50'
+            }), 400
+
         # Mapuj kody pocztowe na region IDs
         # Określ źródło na podstawie typu pojazdu
         source = 'timocom' if vehicle_type in ['naczepa', 'trailer', '3.5t', '3_5t', '12t'] else 'transeu'
@@ -334,14 +397,12 @@ def get_route_pricing():
                 'data_source': 'postgresql'
             }
         })
-        
+
     except Exception as e:
-        print(f"❌ Błąd w /api/route-pricing: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Error in /api/route-pricing endpoint: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': f'Błąd serwera: {str(e)}'
+            'error': 'Wystąpił błąd serwera'
         }), 500
 
 
