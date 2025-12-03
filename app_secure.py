@@ -6,6 +6,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flasgger import Swagger
 import os
 from typing import Optional
 import psycopg2
@@ -29,6 +30,33 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
+
+# Konfiguracja Swaggera
+app.config['SWAGGER'] = {
+    'title': 'Pricing API',
+    'uiversion': 3,
+    'description': 'API do wyceny tras transportowych na podstawie historycznych danych z giełd transportowych.',
+    'termsOfService': '#',
+    'contact': {
+        'name': 'API Support',
+        'url': '#',
+        'email': 'support@example.com',
+    },
+    'license': {
+        'name': 'MIT',
+        'url': 'https://opensource.org/licenses/MIT',
+    },
+    'securityDefinitions': {
+        'ApiKeyAuth': {
+            'type': 'apiKey',
+            'in': 'header',
+            'name': 'X-API-Key',
+            'description': 'Klucz API do autoryzacji. Może być również przekazany jako `Authorization: Bearer <key>`.'
+        }
+    },
+    'specs_route': '/apidocs/'
+}
+swagger = Swagger(app)
 
 # CORS - tylko zaufane domeny (zmień w produkcji!)
 ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:5000').split(',')
@@ -337,7 +365,69 @@ def health_check():
 @require_api_key
 @limiter.limit("5 per minute")  # Max 5 requestów na minutę
 def get_pricing():
-    """Endpoint do pobierania cen dla trasy - SECURED VERSION"""
+    """Pobierz dane cenowe dla trasy
+    Endpoint do pobierania historycznych danych cenowych dla określonej trasy na podstawie kodów pocztowych.
+    ---
+    tags:
+      - Pricing
+    consumes:
+      - application/json
+    produces:
+      - application/json
+    security:
+      - ApiKeyAuth: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          id: PricingRequest
+          type: object
+          properties:
+            start_postal_code:
+              type: string
+              description: Kod pocztowy miejsca początkowego (np. "DE49").
+              example: "DE49"
+            end_postal_code:
+              type: string
+              description: Kod pocztowy miejsca docelowego (np. "PL20").
+              example: "PL20"
+          required:
+            - start_postal_code
+            - end_postal_code
+    responses:
+      200:
+        description: Sukces - dane cenowe zostały zwrócone.
+        schema:
+          id: PricingResponse
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: true
+            data:
+              type: object
+              properties:
+                start_postal_code:
+                  type: string
+                end_postal_code:
+                  type: string
+                pricing:
+                  type: object
+                  description: Obiekt zawierający dane cenowe z różnych źródeł i okresów.
+      400:
+        description: Błąd zapytania - brakujące lub nieprawidłowe dane wejściowe.
+      401:
+        description: Nieautoryzowany - brak klucza API.
+      403:
+        description: Zabroniony - nieprawidłowy klucz API lub wymagane HTTPS.
+      404:
+        description: Nie znaleziono - brak danych dla podanej trasy lub kodów pocztowych.
+      429:
+        description: Przekroczono limit zapytań.
+      500:
+        description: Wewnętrzny błąd serwera.
+    """
     try:
         data = request.json
         
