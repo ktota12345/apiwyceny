@@ -9,6 +9,7 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from freight_api import get_current_offers
 import requests
+import pandas as pd
 
 # Załaduj zmienne środowiskowe z pliku .env
 load_dotenv()
@@ -25,6 +26,10 @@ DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 # Konfiguracja AWS Location Service
 AWS_LOCATION_API_KEY = os.getenv("AWS_LOCATION_API_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "eu-central-1")
+
+# Cache dla CSV z cenami
+_PRICING_DATA_CACHE = None
+_CSV_FILE_PATH = os.path.join(os.path.dirname(__file__), 'TRIVIUM_PRZETARG_2026_pelne_dane_AWS.csv')
 
 # Funkcja do nawiązywania połączenia z bazą danych
 def _get_db_connection():
@@ -782,6 +787,11 @@ def index():
     """Strona główna aplikacji"""
     return render_template('index.html')
 
+@app.route('/api-test')
+def api_test():
+    """Strona testowa dla API wyceny tras"""
+    return render_template('api_test.html')
+
 @app.route('/api/calculate', methods=['POST'])
 def calculate_route():
     """Endpoint do wyceny trasy"""
@@ -933,6 +943,223 @@ def get_current_freight_offers():
                 'offers': [],
                 'message': f'Błąd połączenia z API giełd: {str(e)}'
             }
+        }), 500
+
+@app.route('/api/route-pricing', methods=['POST'])
+def get_route_pricing():
+    """
+    Endpoint do pobierania cen dla trasy na podstawie kodów pocztowych
+    
+    Request JSON:
+    {
+        "start_postal_code": "50-340",
+        "end_postal_code": "08034",
+        "vehicle_type": "naczepa"  // naczepa, 3.5t, 12t, lorry, solo, bus, double_trailer
+    }
+    
+    Response JSON:
+    {
+        "success": true,
+        "data": {
+            "start_postal_code": "50-340",
+            "end_postal_code": "08034",
+            "vehicle_type": "naczepa",
+            "distance_km": 955.63,
+            "pricing": {
+                "timocom": {
+                    "avg_7d": 1.0,
+                    "avg_30d": 1.04,
+                    "avg_90d": 1.07,
+                    "median_7d": 1.05,
+                    "median_30d": 1.05,
+                    "median_90d": 1.08,
+                    "offers_7d": 4012,
+                    "offers_30d": 24835,
+                    "offers_90d": 29253
+                },
+                "transeu": {
+                    "avg_7d": 0.96,
+                    "avg_30d": 0.87,
+                    "avg_90d": 1.1,
+                    ...
+                }
+            }
+        }
+    }
+    """
+    global _PRICING_DATA_CACHE
+    
+    try:
+        data = request.json
+        start_postal = data.get('start_postal_code', '').strip()
+        end_postal = data.get('end_postal_code', '').strip()
+        vehicle_type = data.get('vehicle_type', 'naczepa').lower()
+        
+        if not start_postal or not end_postal:
+            return jsonify({
+                'success': False,
+                'error': 'Brak kodów pocztowych (start_postal_code i end_postal_code wymagane)'
+            }), 400
+        
+        # Załaduj dane CSV (z cache)
+        if _PRICING_DATA_CACHE is None:
+            print(f"📂 Ładowanie danych cenowych z CSV: {_CSV_FILE_PATH}")
+            _PRICING_DATA_CACHE = pd.read_csv(
+                _CSV_FILE_PATH,
+                sep=';',
+                encoding='utf-8',
+                low_memory=False
+            )
+            print(f"✓ Załadowano {len(_PRICING_DATA_CACHE)} tras")
+        
+        df = _PRICING_DATA_CACHE
+        
+        # Znajdź trasę po kodach pocztowych
+        # Normalizacja kodów pocztowych - usuń spacje i myślniki
+        def normalize_postal(postal):
+            if pd.isna(postal):
+                return ''
+            return str(postal).replace(' ', '').replace('-', '').strip()
+        
+        start_normalized = normalize_postal(start_postal)
+        end_normalized = normalize_postal(end_postal)
+        
+        # Szukaj w kolumnach Origin 2 Zip i Destination 2 Zip
+        mask = (
+            df['Origin 2 Zip'].apply(normalize_postal) == start_normalized
+        ) & (
+            df['Destination 2 Zip'].apply(normalize_postal) == end_normalized
+        )
+        
+        matching_routes = df[mask]
+        
+        if len(matching_routes) == 0:
+            return jsonify({
+                'success': False,
+                'error': f'Brak danych dla trasy {start_postal} -> {end_postal}',
+                'message': 'Nie znaleziono trasy w bazie danych'
+            }), 404
+        
+        # Pobierz pierwszy matching route (powinien być tylko jeden)
+        route = matching_routes.iloc[0]
+        
+        # Mapowanie typów pojazdów na prefiksy kolumn
+        vehicle_mapping = {
+            'naczepa': 'TC Naczepa',
+            'trailer': 'TC Naczepa',
+            '3.5t': 'TC 3.5t',
+            '3_5t': 'TC 3.5t',
+            '12t': 'TC 12t',
+            'lorry': 'TE Lorry',
+            'solo': 'TE Solo',
+            'bus': 'TE Bus',
+            'double_trailer': 'TE DblTrailer',
+            'dbl_trailer': 'TE DblTrailer'
+        }
+        
+        column_prefix = vehicle_mapping.get(vehicle_type)
+        
+        if not column_prefix:
+            return jsonify({
+                'success': False,
+                'error': f'Nieznany typ pojazdu: {vehicle_type}',
+                'available_types': list(vehicle_mapping.keys())
+            }), 400
+        
+        # Pobierz dane cenowe dla wybranego typu pojazdu
+        pricing_data = {}
+        
+        # Określ źródło (TimoCom lub Trans.eu)
+        source = 'timocom' if column_prefix.startswith('TC') else 'transeu'
+        
+        # Pobierz wszystkie dostępne metryki
+        metrics = {}
+        
+        # Średnie
+        for period in ['7d', '30d', '90d']:
+            col_name = f"{column_prefix} Avg {period}"
+            if col_name in route:
+                value = route[col_name]
+                if pd.notna(value) and value != '':
+                    try:
+                        metrics[f'avg_{period}'] = float(value)
+                    except (ValueError, TypeError):
+                        metrics[f'avg_{period}'] = None
+                else:
+                    metrics[f'avg_{period}'] = None
+        
+        # Mediany
+        for period in ['7d', '30d', '90d']:
+            col_name = f"{column_prefix} Median {period}"
+            if col_name in route:
+                value = route[col_name]
+                if pd.notna(value) and value != '':
+                    try:
+                        metrics[f'median_{period}'] = float(value)
+                    except (ValueError, TypeError):
+                        metrics[f'median_{period}'] = None
+                else:
+                    metrics[f'median_{period}'] = None
+        
+        # Liczba ofert
+        for period in ['7d', '30d', '90d']:
+            col_name = f"{column_prefix} Oferty {period}"
+            if col_name in route:
+                value = route[col_name]
+                if pd.notna(value) and value != '':
+                    try:
+                        metrics[f'offers_{period}'] = int(float(value))
+                    except (ValueError, TypeError):
+                        metrics[f'offers_{period}'] = None
+                else:
+                    metrics[f'offers_{period}'] = None
+        
+        pricing_data[source] = metrics
+        
+        # Pobierz dystans
+        distance_km = None
+        if 'Dystans [km]' in route:
+            try:
+                distance_km = float(route['Dystans [km]'])
+            except (ValueError, TypeError):
+                pass
+        
+        # Pobierz dodatkowe informacje o trasie
+        route_info = {
+            'lane_name': route.get('Lane Name', 'N/A'),
+            'origin': route.get('Origin', 'N/A'),
+            'origin_country': route.get('Origin Country', 'N/A'),
+            'destination_country': route.get('Destination Country', 'N/A'),
+            'historic_potential': route.get('Historic/Potential', 'N/A')
+        }
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'start_postal_code': start_postal,
+                'end_postal_code': end_postal,
+                'vehicle_type': vehicle_type,
+                'distance_km': distance_km,
+                'pricing': pricing_data,
+                'route_info': route_info,
+                'currency': 'EUR',
+                'unit': 'EUR/km'
+            }
+        })
+        
+    except FileNotFoundError:
+        return jsonify({
+            'success': False,
+            'error': 'Plik z danymi cenowymi nie został znaleziony',
+            'file_path': _CSV_FILE_PATH
+        }), 500
+    except Exception as e:
+        print(f"❌ Błąd w /api/route-pricing: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': f'Błąd serwera: {str(e)}'
         }), 500
 
 @app.route('/api/calculate-distance', methods=['POST'])
