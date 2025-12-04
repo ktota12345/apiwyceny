@@ -1,5 +1,19 @@
 # Changelog - Pricing API
 
+## [2.0.1] - 2024-12-04
+
+### 📚 Documentation
+- **Kompletna aktualizacja Swagger/OpenAPI dokumentacji**:
+  - Dodano brakujące pole `dystans` jako required parameter
+  - Zaktualizowano strukturę response z `calculated_prices` (cena_naczepa, cena_bus, cena_solo)
+  - Dodano szczegółowe przykłady request/response
+  - Dodano walidację pattern dla kodów pocztowych
+  - Zaktualizowano opisy wszystkich kodów błędów (400, 401, 403, 404, 429, 500)
+  - Dodano informacje o walutach i limitach rate limiting
+- Zaktualizowano `/health` endpoint z wersją 2.0.0 i listą features
+
+---
+
 ## [2.0.0] - 2024-12-04
 
 ### 🚀 Performance Improvements

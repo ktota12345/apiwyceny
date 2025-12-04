@@ -404,8 +404,13 @@ def health_check():
     """Health check endpoint - dostępny bez API key"""
     return jsonify({
         'status': 'ok',
-        'service': 'Pricing API (Secured)',
-        'version': '1.1.0'
+        'service': 'Pricing API (Secured & Optimized)',
+        'version': '2.0.0',
+        'features': {
+            'security': 'API Key + Rate Limiting + HTTPS',
+            'optimization': 'Single query (6x faster)',
+            'monitoring': 'Performance metrics enabled'
+        }
     })
 
 
@@ -413,8 +418,9 @@ def health_check():
 @require_api_key
 @limiter.limit("5 per minute")  # Max 5 requestów na minutę
 def get_route_pricing():
-    """Pobierz dane cenowe dla trasy
-    Endpoint do pobierania historycznych danych cenowych dla określonej trasy na podstawie kodów pocztowych.
+    """Pobierz wycenę trasy transportowej
+    Endpoint do obliczania ceny transportu na podstawie kodów pocztowych i dystansu.
+    Używa danych historycznych z TimoCom (średnia z 30 dni) dla trzech typów pojazdów.
     ---
     tags:
       - Pricing
@@ -428,24 +434,33 @@ def get_route_pricing():
       - in: body
         name: body
         required: true
+        description: Dane zapytania o wycenę trasy
         schema:
           id: PricingRequest
           type: object
-          properties:
-            start_postal_code:
-              type: string
-              description: Kod pocztowy miejsca początkowego (np. "DE49").
-              example: "DE49"
-            end_postal_code:
-              type: string
-              description: Kod pocztowy miejsca docelowego (np. "PL20").
-              example: "PL20"
           required:
             - start_postal_code
             - end_postal_code
+            - dystans
+          properties:
+            start_postal_code:
+              type: string
+              description: Kod pocztowy miejsca początkowego (format ISO 2-literowy kod kraju + cyfry, np. "PL20", "DE49")
+              example: "PL20"
+              pattern: "^[A-Z]{2}\\d{1,5}$"
+            end_postal_code:
+              type: string
+              description: Kod pocztowy miejsca docelowego (format ISO 2-literowy kod kraju + cyfry, np. "DE49", "FR75")
+              example: "DE49"
+              pattern: "^[A-Z]{2}\\d{1,5}$"
+            dystans:
+              type: number
+              description: Dystans trasy w kilometrach
+              example: 850
+              minimum: 1
     responses:
       200:
-        description: Sukces - dane cenowe zostały zwrócone.
+        description: Sukces - obliczone ceny dla wszystkich typów pojazdów
         schema:
           id: PricingResponse
           type: object
@@ -458,23 +473,120 @@ def get_route_pricing():
               properties:
                 start_postal_code:
                   type: string
+                  description: Kod pocztowy startu
+                  example: "PL20"
                 end_postal_code:
                   type: string
-                pricing:
+                  description: Kod pocztowy celu
+                  example: "DE49"
+                distance_km:
+                  type: number
+                  description: Dystans w kilometrach
+                  example: 850
+                calculated_prices:
                   type: object
-                  description: Obiekt zawierający dane cenowe z różnych źródeł i okresów.
+                  description: Obliczone ceny dla każdego typu pojazdu (średnia z 30 dni TimoCom * dystans)
+                  properties:
+                    cena_naczepa:
+                      type: number
+                      description: Cena dla naczepy (trailer)
+                      example: 1275.50
+                      nullable: true
+                    cena_bus:
+                      type: number
+                      description: Cena dla busa (do 3.5t)
+                      example: 850.75
+                      nullable: true
+                    cena_solo:
+                      type: number
+                      description: Cena dla solo (do 12t)
+                      example: 1020.25
+                      nullable: true
+                currency:
+                  type: string
+                  description: Waluta cen
+                  example: "EUR"
+        examples:
+          application/json:
+            success: true
+            data:
+              start_postal_code: "PL20"
+              end_postal_code: "DE49"
+              distance_km: 850
+              calculated_prices:
+                cena_naczepa: 1275.50
+                cena_bus: 850.75
+                cena_solo: 1020.25
+              currency: "EUR"
       400:
-        description: Błąd zapytania - brakujące lub nieprawidłowe dane wejściowe.
+        description: Błąd zapytania - brakujące lub nieprawidłowe dane wejściowe
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: false
+            error:
+              type: string
+              example: "Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans"
       401:
-        description: Nieautoryzowany - brak klucza API.
+        description: Nieautoryzowany - brak klucza API
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: false
+            error:
+              type: string
+              example: "Brak API key"
+            message:
+              type: string
+              example: "Wymagany header: X-API-Key lub Authorization: Bearer <key>"
       403:
-        description: Zabroniony - nieprawidłowy klucz API lub wymagane HTTPS.
+        description: Zabroniony - nieprawidłowy klucz API lub wymagane HTTPS
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: false
+            error:
+              type: string
+              example: "Nieprawidłowy API key"
       404:
-        description: Nie znaleziono - brak danych dla podanej trasy lub kodów pocztowych.
+        description: Nie znaleziono - brak danych dla podanej trasy lub kodów pocztowych
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: false
+            error:
+              type: string
+              example: "Brak danych dla trasy PL20 -> DE49"
+            message:
+              type: string
+              example: "Nie znaleziono danych cenowych w bazie dla tej trasy"
       429:
-        description: Przekroczono limit zapytań.
+        description: Przekroczono limit zapytań (5 per minute, 20 per hour, 100 per day)
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: "Rate limit exceeded"
       500:
-        description: Wewnętrzny błąd serwera.
+        description: Wewnętrzny błąd serwera
+        schema:
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: false
+            error:
+              type: string
+              example: "Wewnętrzny błąd serwera"
     """
     try:
         data = request.json

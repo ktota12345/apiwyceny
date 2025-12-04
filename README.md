@@ -1,13 +1,31 @@
-# Pricing API - API wyceny tras transportowych
+# 🚚 Pricing API v2.0 - API wyceny tras transportowych
 
-Standalone REST API do pobierania historycznych cen transportowych z giełd TimoCom i Trans.eu.
+[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](CHANGELOG.md)
+[![Security](https://img.shields.io/badge/security-enhanced-green.svg)](#security)
+[![Performance](https://img.shields.io/badge/performance-optimized-brightgreen.svg)](#performance)
 
-## Funkcjonalność
+Standalone REST API do kalkulacji cen transportowych na podstawie historycznych danych z giełdy TimoCom.
 
-API pobiera średnie i mediany cen transportowych dla zadanej trasy (kod pocztowy start → kod pocztowy koniec) z bazy danych PostgreSQL dla trzech przedziałów czasowych:
-- **7 dni** - ostatni tydzień
-- **30 dni** - ostatni miesiąc
-- **90 dni** - ostatnie 3 miesiące
+## ✨ Funkcjonalność
+
+API oblicza cenę transportu dla zadanej trasy (kod pocztowy start → kod pocztowy koniec) poprzez:
+1. Mapowanie kodów pocztowych na regiony Trans.eu
+2. Konwersję regionów Trans.eu na regiony TimoCom
+3. Pobranie średnich cen z ostatnich **30 dni** z TimoCom
+4. Obliczenie końcowej ceny: `stawka_za_km * dystans` dla każdego typu pojazdu
+
+**Typy pojazdów:**
+- 🚐 **Bus** (do 3.5t)
+- 🚛 **Solo** (do 12t)
+- 🚚 **Naczepa** (trailer)
+
+## 🚀 Co nowego w v2.0?
+
+- ⚡ **6x szybsze** - zredukowano zapytania do bazy z 6 do 1
+- 🔒 **Enhanced security** - dodano security headers (XSS, HSTS, clickjacking protection)
+- 📊 **Performance monitoring** - szczegółowe logi czasów wykonania
+- 🔄 **Connection resilience** - auto-reconnect dla stale DB connections
+- 📚 **Complete Swagger docs** - pełna dokumentacja OpenAPI
 
 ## Wymagania
 
@@ -55,6 +73,14 @@ POSTGRES_PORT=5432
 POSTGRES_USER=twoj_user
 POSTGRES_PASSWORD=twoje_haslo
 POSTGRES_DB=nazwa_bazy
+
+# Security
+API_KEY=wygenerowany-klucz-api
+REQUIRE_API_KEY=true
+ENV=development
+
+# CORS (oddzielone przecinkami)
+ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5000
 ```
 
 ### 5. Uruchom API
@@ -69,225 +95,210 @@ python app.py
 gunicorn -w 4 -b 0.0.0.0:5001 app:app
 ```
 
-API będzie dostępne pod adresem: `http://localhost:5001`
+API będzie dostępne pod adresem: `http://localhost:5003`
 
-## 🔒 Autoryzacja API Key
+### 6. Swagger Documentation
 
-API wymaga klucza autoryzacyjnego. Więcej informacji: **[API_AUTHORIZATION.md](API_AUTHORIZATION.md)**
+Po uruchomieniu API, dokumentacja Swagger dostępna jest pod:
 
-### Szybki start:
+```
+http://localhost:5003/apidocs/
+```
 
-1. Wygeneruj klucz:
+## 🔒 Security & Authentication
+
+### API Key Authentication
+
+Każde żądanie do `/api/route-pricing` wymaga klucza API.
+
+**Sposoby przekazania klucza:**
+
+1. Header `X-API-Key`:
    ```bash
-   python generate_api_key.py
+   X-API-Key: twoj-klucz-api
+   ```
+
+2. Header `Authorization` (Bearer token):
+   ```bash
+   Authorization: Bearer twoj-klucz-api
+   ```
+
+### Konfiguracja API Key
+
+1. Wygeneruj klucz (lub użyj istniejącego):
+   ```bash
+   python -c "import secrets; print(secrets.token_hex(32))"
    ```
 
 2. Dodaj do `.env`:
-   ```
+   ```env
    API_KEY=twoj-wygenerowany-klucz
+   REQUIRE_API_KEY=true
    ```
 
-3. Użyj w requestach:
-   ```bash
-   curl -X POST http://localhost:5001/api/pricing \
-     -H "X-API-Key: twoj-klucz" \
-     -H "Content-Type: application/json" \
-     -d '{"start_postal_code": "PL50", "end_postal_code": "DE10"}'
-   ```
+### Rate Limiting
 
-## Pola odpowiedzi
+- **Global:** 100 requestów/dzień, 20 requestów/godzinę
+- **Endpoint `/api/route-pricing`:** 5 requestów/minutę
 
-### TimoCom
-- **`avg_price_per_km`** - średnie ceny EUR/km dla trailer, 3.5t, 12t
-- **`median_price_per_km`** - mediany cen EUR/km (tylko trailer, reszta null)
-- **`total_offers`** - całkowita liczba ofert w okresie
-- **`offers_by_vehicle_type`** - rozbicie ofert po typach pojazdów
-- **`days_with_data`** - liczba dni z danymi w okresie
+### Security Features
 
-### Trans.eu
-- **`avg_price_per_km`** - średnia cena EUR/km dla lorry
-- **`median_price_per_km`** - mediana ceny EUR/km dla lorry
-- **`total_offers`** - całkowita liczba ofert w okresie
-- **`days_with_data`** - liczba dni z danymi w okresie
+- ✅ Timing-attack resistant authentication (`secrets.compare_digest`)
+- ✅ HTTPS enforcement w produkcji
+- ✅ CORS whitelist
+- ✅ Security headers (XSS, clickjacking, HSTS)
+- ✅ Input validation & sanitization
+- ✅ SQL injection protection
+- ✅ DoS protection (rate limiting, input length limits)
 
-## Użycie API
+## ⚡ Performance
 
-### Endpoint: `/api/pricing`
+### Optymalizacje v2.0
 
-**Method:** `POST`
+- **Single query:** Zredukowano zapytania do bazy z 6 do 1 (~6x szybciej)
+- **Connection pooling:** Min 1, max 10 połączeń z auto-reconnect
+- **Statement timeout:** 30 sekund dla długich zapytań
+- **Connection validation:** Automatyczna weryfikacja połączeń przed użyciem
 
-**Content-Type:** `application/json`
+### Performance Monitoring
+
+W logach aplikacji zobaczysz szczegółowe metryki:
+
+```
+⏱️ Połączenie z bazą: 15ms
+⏱️ Zapytanie SQL (30d): 234ms
+⏱️ CAŁKOWITY CZAS get_timocom_pricing (30d): 250ms
+⏱️ Zapytanie TimoCom 30d: 251ms
+⏱️ Obliczenia cen: 1ms
+⏱️ ⭐ CAŁKOWITY CZAS REQUESTU: 252ms
+```
+
+## 📖 Użycie API
+
+### Endpoint: `/api/route-pricing`
+
+**Method:** `POST`  
+**Content-Type:** `application/json`  
+**Authentication:** API Key (required)
 
 ### Request
 
 ```json
 {
-  "start_postal_code": "PL50",
-  "end_postal_code": "DE10"
+  "start_postal_code": "PL20",
+  "end_postal_code": "DE49",
+  "dystans": 850
 }
 ```
 
-**Format kodów pocztowych:**
-- `KOD_KRAJU` (2 litery) + pierwsze 2 cyfry kodu pocztowego
-- Przykłady: `PL50`, `DE10`, `FR75`, `ES28`, `IT20`
+**Pola:**
+- `start_postal_code` (string, required) - Kod pocztowy startu
+- `end_postal_code` (string, required) - Kod pocztowy celu
+- `dystans` (number, required) - Dystans w kilometrach
 
-### Response (sukces)
+**Format kodów pocztowych:**
+- `KOD_KRAJU` (2 litery ISO) + cyfry (1-5 cyfr)
+- Przykłady: `PL20`, `DE49`, `FR75`, `ES28`, `IT20`
+- Pattern regex: `^[A-Z]{2}\d{1,5}$`
+
+### Response (sukces - 200 OK)
 
 ```json
 {
   "success": true,
   "data": {
-    "start_postal_code": "PL50",
-    "end_postal_code": "DE10",
-    "start_region_id": 134,
-    "end_region_id": 89,
-    "pricing": {
-      "timocom": {
-        "7d": {
-          "avg_price_per_km": {
-            "trailer": 1.05,
-            "3_5t": 0.85,
-            "12t": 0.95
-          },
-          "median_price_per_km": {
-            "trailer": 1.08,
-            "3_5t": null,
-            "12t": null
-          },
-          "total_offers": 4012,
-          "offers_by_vehicle_type": {
-            "trailer": 2340,
-            "3_5t": 892,
-            "12t": 780
-          },
-          "days_with_data": 7
-        },
-        "30d": {
-          "avg_price_per_km": {
-            "trailer": 1.04,
-            "3_5t": 0.84,
-            "12t": 0.94
-          },
-          "median_price_per_km": {
-            "trailer": 1.05,
-            "3_5t": null,
-            "12t": null
-          },
-          "total_offers": 24835,
-          "offers_by_vehicle_type": {
-            "trailer": 14200,
-            "3_5t": 5835,
-            "12t": 4800
-          },
-          "days_with_data": 30
-        },
-        "90d": {
-          "avg_price_per_km": {
-            "trailer": 1.07,
-            "3_5t": 0.86,
-            "12t": 0.96
-          },
-          "median_price_per_km": {
-            "trailer": 1.08,
-            "3_5t": null,
-            "12t": null
-          },
-          "total_offers": 29253,
-          "offers_by_vehicle_type": {
-            "trailer": 16500,
-            "3_5t": 6753,
-            "12t": 6000
-          },
-          "days_with_data": 85
-        }
-      },
-      "transeu": {
-        "7d": {
-          "avg_price_per_km": {
-            "lorry": 0.96
-          },
-          "median_price_per_km": {
-            "lorry": 0.98
-          },
-          "total_offers": 1580,
-          "days_with_data": 7
-        },
-        "30d": {
-          "avg_price_per_km": {
-            "lorry": 0.87
-          },
-          "median_price_per_km": {
-            "lorry": 0.89
-          },
-          "total_offers": 9240,
-          "days_with_data": 28
-        },
-        "90d": {
-          "avg_price_per_km": {
-            "lorry": 1.10
-          },
-          "median_price_per_km": {
-            "lorry": 1.12
-          },
-          "total_offers": 28350,
-          "days_with_data": 82
-        }
-      }
+    "start_postal_code": "PL20",
+    "end_postal_code": "DE49",
+    "distance_km": 850,
+    "calculated_prices": {
+      "cena_naczepa": 1275.50,
+      "cena_bus": 850.75,
+      "cena_solo": 1020.25
     },
-    "currency": "EUR",
-    "unit": "EUR/km",
-    "data_sources": {
-      "timocom": true,
-      "transeu": true
-    }
+    "currency": "EUR"
   }
 }
 ```
 
-### Response (błąd - brak danych)
+**Pola odpowiedzi:**
+- `success` (boolean) - Status powodzenia
+- `data.start_postal_code` (string) - Kod pocztowy startu
+- `data.end_postal_code` (string) - Kod pocztowy celu
+- `data.distance_km` (number) - Dystans w km
+- `data.calculated_prices` (object) - Obliczone ceny:
+  - `cena_naczepa` (number|null) - Cena dla naczepy w EUR
+  - `cena_bus` (number|null) - Cena dla busa w EUR
+  - `cena_solo` (number|null) - Cena dla solo w EUR
+- `data.currency` (string) - Waluta ("EUR")
+
+### Response (błąd - 400 Bad Request)
 
 ```json
 {
   "success": false,
-  "error": "Brak danych dla trasy PL50 -> DE10",
+  "error": "Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans"
+}
+```
+
+### Response (błąd - 401 Unauthorized)
+
+```json
+{
+  "success": false,
+  "error": "Brak API key",
+  "message": "Wymagany header: X-API-Key lub Authorization: Bearer <key>"
+}
+```
+
+### Response (błąd - 404 Not Found)
+
+```json
+{
+  "success": false,
+  "error": "Brak danych dla trasy PL20 -> DE49",
   "message": "Nie znaleziono danych cenowych w bazie dla tej trasy"
 }
 ```
 
-### Response (błąd - nieprawidłowy kod)
+### Response (błąd - 429 Too Many Requests)
 
 ```json
 {
-  "success": false,
-  "error": "Nie znaleziono regionu dla kodów: PL99",
-  "message": "Użyj formatu: KOD_KRAJU + 2 cyfry (np. PL50, DE10, FR75)"
+  "error": "Rate limit exceeded"
 }
 ```
 
-## Health Check
+## 🏥 Health Check
 
 ### Endpoint: `/health`
 
-**Method:** `GET`
+**Method:** `GET`  
+**Authentication:** None (public endpoint)
 
 **Response:**
 
 ```json
 {
   "status": "ok",
-  "service": "Pricing API",
-  "version": "1.0.0"
+  "service": "Pricing API (Secured & Optimized)",
+  "version": "2.0.0",
+  "features": {
+    "security": "API Key + Rate Limiting + HTTPS",
+    "optimization": "Single query (6x faster)",
+    "monitoring": "Performance metrics enabled"
+  }
 }
 ```
 
-## Przykłady użycia
+## 📝 Przykłady użycia
 
 ### cURL
 
 ```bash
-curl -X POST http://localhost:5001/api/pricing \
+curl -X POST http://localhost:5003/api/route-pricing \
   -H "Content-Type: application/json" \
-  -d '{"start_postal_code": "PL50", "end_postal_code": "DE10"}'
+  -H "X-API-Key: twoj-klucz-api" \
+  -d '{"start_postal_code": "PL20", "end_postal_code": "DE49", "dystans": 850}'
 ```
 
 ### Python (requests)
@@ -295,38 +306,49 @@ curl -X POST http://localhost:5001/api/pricing \
 ```python
 import requests
 
-response = requests.post(
-    'http://localhost:5001/api/pricing',
-    json={
-        'start_postal_code': 'PL50',
-        'end_postal_code': 'DE10'
-    }
-)
+url = "http://localhost:5003/api/route-pricing"
 
+payload = {
+    "start_postal_code": "PL20",
+    "end_postal_code": "DE49",
+    "dystans": 850
+}
+
+headers = {
+    'Content-Type': 'application/json',
+    'X-API-Key': 'twoj-klucz-api'
+}
+
+response = requests.post(url, json=payload, headers=headers)
 data = response.json()
+
 if data['success']:
-    timocom_7d = data['data']['pricing']['timocom']['7d']
-    print(f"TimoCom 7d średnia (trailer): {timocom_7d['avg_price_per_km']['trailer']} EUR/km")
-    print(f"Oferty: {timocom_7d['total_offers']}")
+    prices = data['data']['calculated_prices']
+    print(f"Cena naczepa: {prices['cena_naczepa']} EUR")
+    print(f"Cena bus: {prices['cena_bus']} EUR")
+    print(f"Cena solo: {prices['cena_solo']} EUR")
 ```
 
 ### JavaScript (fetch)
 
 ```javascript
-fetch('http://localhost:5001/api/pricing', {
+fetch('http://localhost:5003/api/route-pricing', {
   method: 'POST',
   headers: {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'X-API-Key': 'twoj-klucz-api'
   },
   body: JSON.stringify({
-    start_postal_code: 'PL50',
-    end_postal_code: 'DE10'
+    start_postal_code: 'PL20',
+    end_postal_code: 'DE49',
+    dystans: 850
   })
 })
 .then(res => res.json())
 .then(data => {
   if (data.success) {
-    console.log('TimoCom 7d:', data.data.pricing.timocom['7d']);
+    console.log('Calculated prices:', data.data.calculated_prices);
+    console.log(`Naczepa: ${data.data.calculated_prices.cena_naczepa} EUR`);
   }
 });
 ```
