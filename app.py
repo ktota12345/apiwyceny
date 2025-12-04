@@ -1,165 +1,234 @@
-from flask import Flask, render_template, jsonify, request, redirect
-import random
+"""
+Pricing API - SECURED VERSION
+Wersja z zabezpieczeniami przed exploitami
+"""
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flasgger import Swagger
 import os
-from datetime import datetime, timedelta
-from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Optional
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-from freight_api import get_current_offers
-import requests
-import pandas as pd
+import json
+from functools import wraps
+import secrets
+import re
+import logging
+import time
 
-# Załaduj zmienne środowiskowe z pliku .env
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Załaduj zmienne środowiskowe
 load_dotenv()
 
 app = Flask(__name__)
 
-# Konfiguracja połączenia z bazą danych
+# STARTUP LOG - WERSJA Z OPTYMALIZACJĄ (1 zapytanie zamiast 6)
+print("""
+**********************************************
+*                                            *
+*   SECURED & OPTIMIZED PRICING API v2.0    *
+*   - Single query optimization             *
+*   - Connection pooling with validation    *
+*   - Performance monitoring                *
+*                                            *
+**********************************************
+""")
+
+# Konfiguracja Swaggera
+app.config['SWAGGER'] = {
+    'title': 'Pricing API',
+    'uiversion': 3,
+    'description': 'API do wyceny tras transportowych na podstawie historycznych danych z giełd transportowych.',
+    'termsOfService': '#',
+    'contact': {
+        'name': 'API Support',
+        'url': '#',
+        'email': 'support@example.com',
+    },
+    'license': {
+        'name': 'MIT',
+        'url': 'https://opensource.org/licenses/MIT',
+    },
+    'securityDefinitions': {
+        'ApiKeyAuth': {
+            'type': 'apiKey',
+            'in': 'header',
+            'name': 'X-API-Key',
+            'description': 'Klucz API do autoryzacji. Może być również przekazany jako `Authorization: Bearer <key>`.'
+        }
+    },
+    'specs_route': '/apidocs/'
+}
+swagger = Swagger(app)
+
+# CORS - tylko zaufane domeny (zmień w produkcji!)
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:5000').split(',')
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ALLOWED_ORIGINS,
+        "methods": ["POST"],
+        "allow_headers": ["Content-Type", "X-API-Key", "Authorization"]
+    }
+})
+
+# Rate Limiting - ogranicz liczbę requestów
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["100 per day", "20 per hour"],
+    storage_uri="memory://",
+    strategy="fixed-window"
+)
+
+# Konfiguracja
 DB_HOST = os.getenv("POSTGRES_HOST")
 DB_PORT = os.getenv("POSTGRES_PORT")
 DB_USER = os.getenv("POSTGRES_USER")
 DB_NAME = os.getenv("POSTGRES_DB")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+API_KEY = os.getenv('API_KEY', '')
+ENV = os.getenv('ENV', 'development')
 
-# Konfiguracja AWS Location Service
-AWS_LOCATION_API_KEY = os.getenv("AWS_LOCATION_API_KEY")
-AWS_REGION = os.getenv("AWS_REGION", "eu-central-1")
+# Connection Pool - zamiast tworzyć nowe połączenie za każdym razem
+try:
+    connection_pool = pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=10,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        cursor_factory=RealDictCursor,
+        connect_timeout=10,
+        options='-c statement_timeout=30000'  # 30 sekund timeout dla zapytań
+    )
+    logger.info("✅ Connection pool initialized")
+except Exception as e:
+    logger.error(f"❌ Failed to create connection pool: {e}")
+    connection_pool = None
 
-# Cache dla CSV z cenami
-_PRICING_DATA_CACHE = None
-_CSV_FILE_PATH = os.path.join(os.path.dirname(__file__), 'TRIVIUM_PRZETARG_2026_pelne_dane_AWS.csv')
+# Cache
+_TRANSEU_TO_TIMOCOM_MAPPING = None
+_POSTAL_CODE_MAPPING = None
 
-# Funkcja do nawiązywania połączenia z bazą danych
-def _get_db_connection():
-    """Nawiązuje połączenie z bazą danych PostgreSQL"""
-    if not all([DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME]):
-        print("Ostrzeżenie: Brak pełnej konfiguracji bazy danych. Używam losowych danych.")
-        return None
-    
-    try:
-        return psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            database=DB_NAME,
-            cursor_factory=RealDictCursor,
-        )
-    except Exception as exc:
-        print(f"Błąd połączenia z bazą danych: {exc}")
-        return None
+# Regex dla walidacji kodu pocztowego (2 litery + 1-5 cyfr)
+POSTAL_CODE_PATTERN = re.compile(r'^[A-Z]{2}\d{1,5}$')
 
-# Funkcja do konwersji Decimal na float
-def _decimal_to_float(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Konwertuje wartości Decimal na float w słowniku"""
-    converted = {}
-    for key, value in record.items():
-        if isinstance(value, Decimal):
-            converted[key] = float(value)
-        else:
-            converted[key] = value
-    return converted
 
-# Funkcja do obliczania dystansu przez AWS Location Service API
-def get_aws_route_distance(start_lat: float, start_lng: float, end_lat: float, end_lng: float, 
-                           return_geometry: bool = False) -> Optional[Dict]:
+@app.after_request
+def add_security_headers(response):
+    """Dodaje security headers do każdej odpowiedzi"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+
+@app.before_request
+def enforce_https():
+    """Wymusza HTTPS w produkcji"""
+    if ENV == 'production' and not request.is_secure:
+        logger.warning(f"⚠️ HTTP request blocked from {request.remote_addr}")
+        return jsonify({
+            'success': False,
+            'error': 'HTTPS required'
+        }), 403
+
+
+def require_api_key(f):
+    """Dekorator sprawdzający API key - odporny na timing attacks"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key') or request.headers.get('Authorization', '').replace('Bearer ', '')
+        
+        if not api_key:
+            logger.warning(f"⚠️ Missing API key from {request.remote_addr}")
+            return jsonify({
+                'success': False,
+                'error': 'Brak API key',
+                'message': 'Wymagany header: X-API-Key lub Authorization: Bearer <key>'
+            }), 401
+        
+        # secrets.compare_digest - zabezpiecza przed timing attacks
+        if not secrets.compare_digest(api_key, API_KEY):
+            logger.warning(f"⚠️ Invalid API key attempt from {request.remote_addr}: {api_key[:10]}...")
+            return jsonify({
+                'success': False,
+                'error': 'Nieprawidłowy API key'
+            }), 403
+        
+        logger.info(f"✅ Authorized request from {request.remote_addr}")
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def validate_postal_code(postal_code: str) -> bool:
     """
-    Wywołuje AWS Location Service Routes API aby obliczyć rzeczywisty dystans drogowy.
+    Waliduje format kodu pocztowego
     
     Args:
-        start_lat, start_lng: Współrzędne startu
-        end_lat, end_lng: Współrzędne końca
-        return_geometry: Czy zwrócić również geometrię trasy (dla mapy)
+        postal_code: Kod pocztowy do walidacji
     
     Returns:
-        Dict z 'distance' (km) i opcjonalnie 'geometry' (lista punktów [lng, lat])
-        lub None w przypadku błędu
+        True jeśli poprawny format, False w przeciwnym razie
     """
-    if not AWS_LOCATION_API_KEY:
-        print("[AWS] ❌ BŁĄD: Brak API key - używam fallback")
-        print(f"[AWS] AWS_LOCATION_API_KEY = {AWS_LOCATION_API_KEY}")
-        return None
+    if not postal_code:
+        return False
+    
+    # Limit długości - ochrona przed DoS
+    if len(postal_code) > 10:
+        logger.warning(f"⚠️ Postal code too long: {len(postal_code)} chars")
+        return False
+    
+    # Walidacja formatu regex
+    return bool(POSTAL_CODE_PATTERN.match(postal_code))
+
+
+def _get_db_connection():
+    """Pobiera połączenie z pool i weryfikuje, czy jest aktywne"""
+    if connection_pool is None:
+        raise Exception("Connection pool not initialized")
     
     try:
-        # AWS Location Service Routes API v2 endpoint
-        url = f"https://routes.geo.{AWS_REGION}.amazonaws.com/v2/routes?key={AWS_LOCATION_API_KEY}"
+        conn = connection_pool.getconn()
         
-        print(f"[AWS] 🌐 URL: {url[:80]}...")
-        print(f"[AWS] 📍 Origin: [{start_lng}, {start_lat}]")
-        print(f"[AWS] 📍 Destination: [{end_lng}, {end_lat}]")
+        # Sprawdź czy połączenie jest aktywne
+        try:
+            with conn.cursor() as test_cursor:
+                test_cursor.execute('SELECT 1')
+        except Exception as e:
+            logger.warning(f"⚠️ Stale connection detected, reconnecting: {e}")
+            # Jeśli połączenie martwe, zamknij i pobierz nowe
+            try:
+                conn.close()
+            except:
+                pass
+            connection_pool.putconn(conn, close=True)
+            conn = connection_pool.getconn()
         
-        headers = {
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "Origin": [start_lng, start_lat],
-            "Destination": [end_lng, end_lat],
-            "TravelMode": "Truck",
-            "OptimizeRoutingFor": "FastestRoute",
-            "LegGeometryFormat": "Simple"  # Żądaj geometrii trasy
-        }
-        
-        print(f"[AWS] 📤 Wysyłam request do AWS...")
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        print(f"[AWS] 📥 Otrzymano odpowiedź: status={response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            if 'Routes' in data and len(data['Routes']) > 0:
-                route = data['Routes'][0]
-                
-                # Suma dystansów ze wszystkich legs
-                total_distance = 0
-                for leg in route.get('Legs', []):
-                    vehicle_details = leg.get('VehicleLegDetails', {})
-                    travel_steps = vehicle_details.get('TravelSteps', [])
-                    for step in travel_steps:
-                        total_distance += step.get('Distance', 0)
-                
-                distance_km = total_distance / 1000.0
-                result = {'distance': round(distance_km, 2)}
-                
-                # Dodaj geometrię jeśli żądana
-                if return_geometry:
-                    geometry_points = []
-                    for leg in route.get('Legs', []):
-                        leg_geometry = leg.get('Geometry', {})
-                        if 'LineString' in leg_geometry:
-                            # LineString to lista punktów [lng, lat]
-                            geometry_points.extend(leg_geometry['LineString'])
-                    
-                    result['geometry'] = geometry_points
-                    result['duration'] = route.get('Summary', {}).get('Duration', 0)  # Czas w sekundach
-                    print(f"[AWS] ✓ Dystans: {distance_km:.2f} km, Punkty trasy: {len(geometry_points)}")
-                else:
-                    print(f"[AWS] ✓ Dystans AWS: {distance_km:.2f} km")
-                
-                return result
-        
-        print(f"[AWS] ❌ Błąd API: status={response.status_code}")
-        print(f"[AWS] Response body: {response.text[:500]}")
-        return None
-            
-    except requests.exceptions.Timeout:
-        print("[AWS] ❌ Timeout (15s) - brak odpowiedzi od AWS")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        print(f"[AWS] ❌ ConnectionError: {e}")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"[AWS] ❌ RequestException: {e}")
-        return None
+        return conn
     except Exception as e:
-        print(f"[AWS] ❌ Nieoczekiwany błąd: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        logger.error(f"❌ Failed to get connection from pool: {e}")
+        raise
 
-# Załaduj mapowanie Trans.eu -> TimoCom z pliku JSON
-_TRANSEU_TO_TIMOCOM_MAPPING = None
+
+def _return_db_connection(conn):
+    """Zwraca połączenie do pool"""
+    if connection_pool and conn:
+        connection_pool.putconn(conn)
+
 
 def _load_transeu_timocom_mapping():
     """Ładuje mapowanie Trans.eu -> TimoCom z pliku JSON"""
@@ -169,70 +238,48 @@ def _load_transeu_timocom_mapping():
         return _TRANSEU_TO_TIMOCOM_MAPPING
     
     try:
-        import json
-        mapping_path = os.path.join(os.path.dirname(__file__), 'static', 'data', 'transeu_to_timocom_mapping.json')
+        mapping_path = os.path.join(os.path.dirname(__file__), 'data', 'transeu_to_timocom_mapping.json')
         with open(mapping_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            # Konwertuj klucze ze string na int
             _TRANSEU_TO_TIMOCOM_MAPPING = {int(k): v['timocom_id'] for k, v in data.items()}
-        print(f"✓ Załadowano mapowanie Trans.eu -> TimoCom ({len(_TRANSEU_TO_TIMOCOM_MAPPING)} regionów)")
+        logger.info(f"✅ Loaded Trans.eu->TimoCom mapping ({len(_TRANSEU_TO_TIMOCOM_MAPPING)} regions)")
     except Exception as e:
-        print(f"⚠ Nie udało się załadować mapowania Trans.eu -> TimoCom: {e}")
+        logger.error(f"❌ Failed to load mapping: {e}")
         _TRANSEU_TO_TIMOCOM_MAPPING = {}
     
     return _TRANSEU_TO_TIMOCOM_MAPPING
 
-# Funkcja do mapowania Trans.eu ID na TimoCom ID
-def map_transeu_to_timocom_id(transeu_id: int):
-    """Mapuje Trans.eu region ID na TimoCom region ID
-    
-    Używa wygenerowanego pliku mapowania opartego na odległościach geograficznych
-    """
+
+def map_transeu_to_timocom_id(transeu_id: int) -> int:
+    """Konwertuje Trans.eu region ID na TimoCom region ID"""
     mapping = _load_transeu_timocom_mapping()
-    
-    # Zwróć zmapowane ID lub oryginalne jeśli brak w mapowaniu
     return mapping.get(transeu_id, transeu_id)
 
-# Funkcja do pobierania danych z TimoCom
-def get_timocom_data(start_region_id: int, end_region_id: int, distance: float, days: int = 7):
-    """Pobiera dane cenowe TimoCom z bazy danych PostgreSQL
+
+def get_timocom_pricing(start_region_id: int, end_region_id: int, days: int = 7):
+    """Pobiera dane cenowe TimoCom z bazy danych PostgreSQL"""
+    start_time = time.time()
     
-    UWAGA: start_region_id i end_region_id to Trans.eu ID!
-    Funkcja konwertuje je na TimoCom ID przed zapytaniem do bazy.
-    """
-    # Konwertuj Trans.eu ID na TimoCom ID
     timocom_start_id = map_transeu_to_timocom_id(start_region_id)
     timocom_end_id = map_transeu_to_timocom_id(end_region_id)
     
-    print(f"🔄 Mapowanie: Trans.eu [{start_region_id} -> {end_region_id}] → TimoCom [{timocom_start_id} -> {timocom_end_id}]")
-    
-    conn = _get_db_connection()
-    
-    # Jeśli brak połączenia, zwróć informację o braku danych
-    if not conn:
-        return {
-            'has_data': False,
-            'offers': [],
-            'average_rate_per_km': None,
-            'average_total_price': None,
-            'average_offers_per_day': None,
-            'days': days,
-            'data_source': 'no_connection',
-            'message': 'Brak połączenia z bazą danych'
-        }
-    
+    conn = None
     try:
+        conn_start = time.time()
+        conn = _get_db_connection()
+        logger.info(f"⏱️ Połączenie z bazą: {(time.time() - conn_start)*1000:.0f}ms")
+        
         with conn.cursor() as cur:
-            # Zapytanie do bazy - agregacja średnich cen dla różnych typów pojazdów
-            # Używamy enlistment_date (format yyyy-mm-dd) do filtrowania po okresie
-            # Zoptymalizowane - agregujemy bezpośrednio bez grupowania po datach
-            
             query = """
                 SELECT
                     ROUND(AVG(o.trailer_avg_price_per_km), 4) AS avg_trailer_price,
                     ROUND(AVG(o.vehicle_up_to_3_5_t_avg_price_per_km), 4) AS avg_3_5t_price,
                     ROUND(AVG(o.vehicle_up_to_12_t_avg_price_per_km), 4) AS avg_12t_price,
+                    ROUND(AVG(o.trailer_median_price_per_km), 4) AS median_trailer_price,
                     SUM(o.number_of_offers_total) AS total_offers,
+                    SUM(o.number_of_offers_trailer) AS total_offers_trailer,
+                    SUM(o.number_of_offers_vehicle_up_to_3_5_t) AS total_offers_3_5t,
+                    SUM(o.number_of_offers_vehicle_up_to_12_t) AS total_offers_12t,
                     COUNT(DISTINCT o.enlistment_date) AS days_count
                 FROM public.offers AS o
                 WHERE o.starting_id = %s
@@ -240,131 +287,55 @@ def get_timocom_data(start_region_id: int, end_region_id: int, distance: float, 
                   AND o.enlistment_date >= CURRENT_DATE - CAST(%s AS INTEGER);
             """
             
+            query_start = time.time()
             cur.execute(query, (timocom_start_id, timocom_end_id, days))
             result = cur.fetchone()
+            logger.info(f"⏱️ Zapytanie SQL ({days}d): {(time.time() - query_start)*1000:.0f}ms")
             
             if not result or (not result['avg_trailer_price'] and not result['avg_3_5t_price'] and not result['avg_12t_price']):
-                print(f"Brak danych w bazie dla trasy TimoCom {timocom_start_id} -> {timocom_end_id} (Trans.eu {start_region_id} -> {end_region_id}).")
-                return {
-                    'has_data': False,
-                    'offers': [],
-                    'average_rate_per_km': None,
-                    'average_total_price': None,
-                    'average_offers_per_day': None,
-                    'days': days,
-                    'data_source': 'database',
-                    'message': 'Brak danych dla tej trasy w wybranym okresie'
-                }
-            
-            # Konwersja wyników z bazy na format aplikacji
-            # Symulacja ofert dla różnych giełd na podstawie średnich z bazy
-            exchanges = ['Trans.eu', 'TimoCom']  # Tylko TimoCom i Trans.eu
-            offers = []
-            
-            # Pobierz średnie ceny bezpośrednio z wyniku
-            avg_trailer = float(result['avg_trailer_price']) if result['avg_trailer_price'] else None
-            avg_3_5t = float(result['avg_3_5t_price']) if result['avg_3_5t_price'] else None
-            avg_12t = float(result['avg_12t_price']) if result['avg_12t_price'] else None
-            
-            # Użyj najlepszej dostępnej średniej (priorytet: naczepa > 12t > 3.5t)
-            base_rate = avg_trailer or avg_12t or avg_3_5t or 0.50
-            
-            # Pobierz faktyczną liczbę ofert z bazy
-            total_offers_sum = int(result['total_offers']) if result['total_offers'] else 0
-            
-            # Liczba dni z danymi
-            num_days = int(result['days_count']) if result['days_count'] else 0
-            offers_per_day_estimate = round(total_offers_sum / num_days, 1) if num_days > 0 else 0
-            
-            # Generuj oferty dla różnych giełd - BEZ losowania, deterministyczne warianty
-            # Każda giełda ma stałą wariancję od base_rate
-            exchange_offsets = {
-                'Trans.eu': -0.02,     # 2 centy taniej
-                'TimoCom': 0.00        # Bazowa cena
-            }
-            
-            for exchange in exchanges:
-                offset = exchange_offsets[exchange]
-                rate_per_km = base_rate + offset
-                total_price = rate_per_km * distance
-                
-                offers.append({
-                    'exchange': exchange,
-                    'rate_per_km': round(rate_per_km, 2),
-                    'total_price': round(total_price, 2),
-                    'currency': 'EUR',
-                    'date': datetime.now().strftime('%Y-%m-%d'),  # Dzisiejsza data (bez losowania)
-                    'offers_per_day': offers_per_day_estimate
-                })
-            
-            # Średnie są teraz deterministyczne (zawsze takie same)
-            avg_rate = sum(o['rate_per_km'] for o in offers) / len(offers)
-            avg_total = sum(o['total_price'] for o in offers) / len(offers)
-            avg_offers_per_day = offers_per_day_estimate  # Nie uśredniaj - to i tak ta sama wartość
-            
-            print(f"✓ Pobrano dane TimoCom z bazy ({days} dni): {num_days} dni z danymi, {total_offers_sum} ofert, średnia stawka: {avg_rate:.2f} EUR/km")
+                return None
             
             return {
-                'has_data': True,
-                'offers': offers,
-                'average_rate_per_km': round(avg_rate, 2),
-                'average_total_price': round(avg_total, 2),
-                'average_offers_per_day': round(avg_offers_per_day, 1),
-                'days': days,
-                'data_source': 'database_timocom',
-                'records_count': num_days,
-                'total_offers_sum': total_offers_sum
+                'avg_price_per_km': {
+                    'trailer': float(result['avg_trailer_price']) if result['avg_trailer_price'] else None,
+                    '3_5t': float(result['avg_3_5t_price']) if result['avg_3_5t_price'] else None,
+                    '12t': float(result['avg_12t_price']) if result['avg_12t_price'] else None
+                },
+                'median_price_per_km': {
+                    'trailer': float(result['median_trailer_price']) if result['median_trailer_price'] else None,
+                    '3_5t': None,
+                    '12t': None
+                },
+                'total_offers': int(result['total_offers']) if result['total_offers'] else 0,
+                'offers_by_vehicle_type': {
+                    'trailer': int(result['total_offers_trailer']) if result['total_offers_trailer'] else 0,
+                    '3_5t': int(result['total_offers_3_5t']) if result['total_offers_3_5t'] else 0,
+                    '12t': int(result['total_offers_12t']) if result['total_offers_12t'] else 0
+                },
+                'days_with_data': int(result['days_count']) if result['days_count'] else 0
             }
             
     except Exception as exc:
-        print(f"Błąd podczas pobierania danych TimoCom z bazy: {exc}")
-        return {
-            'has_data': False,
-            'offers': [],
-            'average_rate_per_km': None,
-            'average_total_price': None,
-            'average_offers_per_day': None,
-            'days': days,
-            'data_source': 'error',
-            'message': f'Błąd zapytania do bazy: {str(exc)}'
-        }
+        logger.error(f"❌ TimoCom query error: {exc}", exc_info=True)
+        return None
     finally:
-        conn.close()
+        if conn:
+            _return_db_connection(conn)
+        logger.info(f"⏱️ CAŁKOWITY CZAS get_timocom_pricing ({days}d): {(time.time() - start_time)*1000:.0f}ms")
 
-# Funkcja do pobierania danych z Trans.eu
-def get_transeu_data(start_region_id: int, end_region_id: int, distance: float, days: int = 7):
-    """Pobiera dane cenowe Trans.eu z bazy danych PostgreSQL
-    
-    Trans.eu używa własnych ID regionów (bez konwersji)
-    """
-    print(f"🔄 Trans.eu: Zapytanie dla regionów {start_region_id} -> {end_region_id}")
-    
-    conn = _get_db_connection()
-    
-    # Jeśli brak połączenia, zwróć informację o braku danych
-    if not conn:
-        return {
-            'has_data': False,
-            'offers': [],
-            'average_rate_per_km': None,
-            'average_total_price': None,
-            'average_offers_per_day': None,
-            'days': days,
-            'data_source': 'no_connection',
-            'message': 'Brak połączenia z bazą danych'
-        }
-    
+
+def get_transeu_pricing(start_region_id: int, end_region_id: int, days: int = 7):
+    """Pobiera dane cenowe Trans.eu z bazy danych PostgreSQL"""
+    conn = None
     try:
+        conn = _get_db_connection()
+        
         with conn.cursor() as cur:
-            # Zapytanie do bazy Trans.eu - tabela OffersTransEU
-            # Trans.eu ma tylko jedną kolumnę cenową: lorry_avg_price_per_km
-            # UWAGA: Trans.eu nie ma kolumny number_of_offers_total, więc nie liczymy ofert
-            # Używamy enlistment_date (format yyyy-mm-dd) do filtrowania po okresie
-            # Zoptymalizowane - agregujemy bezpośrednio bez grupowania po datach
-            
             query = """
                 SELECT
                     ROUND(AVG(o.lorry_avg_price_per_km), 4) AS avg_lorry_price,
+                    ROUND(AVG(o.lorry_median_price_per_km), 4) AS median_lorry_price,
+                    SUM(o.number_of_offers) AS total_offers,
                     COUNT(DISTINCT o.enlistment_date) AS days_count
                 FROM public."OffersTransEU" AS o
                 WHERE o.starting_id = %s
@@ -376,864 +347,269 @@ def get_transeu_data(start_region_id: int, end_region_id: int, distance: float, 
             result = cur.fetchone()
             
             if not result or not result['avg_lorry_price']:
-                print(f"Brak danych Trans.eu w bazie dla trasy {start_region_id} -> {end_region_id}.")
-                return {
-                    'has_data': False,
-                    'offers': [],
-                    'average_rate_per_km': None,
-                    'average_total_price': None,
-                    'average_offers_per_day': None,
-                    'days': days,
-                    'data_source': 'database_transeu',
-                    'message': 'Brak danych dla tej trasy w wybranym okresie'
-                }
-            
-            # Konwersja wyników z bazy na format aplikacji
-            exchanges = ['Trans.eu', 'TimoCom']  # Tylko TimoCom i Trans.eu
-            offers = []
-            
-            # Pobierz średnią cenę bezpośrednio z wyniku
-            avg_lorry = float(result['avg_lorry_price']) if result['avg_lorry_price'] else None
-            num_days = int(result['days_count']) if result['days_count'] else 0
-            
-            # Użyj średniej lorry jako base rate
-            base_rate = avg_lorry or 0.50
-            
-            # Generuj oferty dla różnych giełd - BEZ losowania, deterministyczne warianty
-            # Każda giełda ma stałą wariancję od base_rate
-            exchange_offsets = {
-                'Trans.eu': -0.02,     # 2 centy taniej
-                'TimoCom': 0.00        # Bazowa cena
-            }
-            
-            for exchange in exchanges:
-                offset = exchange_offsets[exchange]
-                rate_per_km = base_rate + offset
-                total_price = rate_per_km * distance
-                
-                offers.append({
-                    'exchange': exchange,
-                    'rate_per_km': round(rate_per_km, 2),
-                    'total_price': round(total_price, 2),
-                    'currency': 'EUR',
-                    'date': datetime.now().strftime('%Y-%m-%d'),  # Dzisiejsza data (bez losowania)
-                    'offers_per_day': None  # Trans.eu nie ma danych o liczbie ofert w bazie
-                })
-            
-            # Średnie są teraz deterministyczne (zawsze takie same)
-            avg_rate = sum(o['rate_per_km'] for o in offers) / len(offers)
-            avg_total = sum(o['total_price'] for o in offers) / len(offers)
-            
-            print(f"✓ Pobrano dane Trans.eu z bazy ({days} dni): {num_days} dni z danymi, średnia stawka: {avg_rate:.2f} EUR/km")
+                return None
             
             return {
-                'has_data': True,
-                'offers': offers,
-                'average_rate_per_km': round(avg_rate, 2),
-                'average_total_price': round(avg_total, 2),
-                'average_offers_per_day': None,  # Trans.eu nie ma danych o liczbie ofert
-                'days': days,
-                'data_source': 'database_transeu',
-                'records_count': num_days
+                'avg_price_per_km': {
+                    'lorry': float(result['avg_lorry_price']) if result['avg_lorry_price'] else None
+                },
+                'median_price_per_km': {
+                    'lorry': float(result['median_lorry_price']) if result['median_lorry_price'] else None
+                },
+                'total_offers': int(result['total_offers']) if result['total_offers'] else 0,
+                'days_with_data': int(result['days_count']) if result['days_count'] else 0
             }
             
     except Exception as exc:
-        print(f"Błąd podczas pobierania danych Trans.eu z bazy: {exc}")
-        return {
-            'has_data': False,
-            'offers': [],
-            'average_rate_per_km': None,
-            'average_total_price': None,
-            'average_offers_per_day': None,
-            'days': days,
-            'data_source': 'error',
-            'message': f'Błąd zapytania do bazy Trans.eu: {str(exc)}'
-        }
+        logger.error(f"❌ Trans.eu query error: {exc}", exc_info=True)
+        return None
     finally:
-        conn.close()
+        if conn:
+            _return_db_connection(conn)
 
-# Funkcja agregująca dane z różnych giełd
-def get_aggregated_exchange_data(start_region_id: int, end_region_id: int, distance: float, days: int = 7):
-    """Agreguje dane z różnych giełd (TimoCom, Trans.eu, etc.)"""
-    
-    # Pobierz dane z TimoCom
-    timocom_data = get_timocom_data(start_region_id, end_region_id, distance, days)
-    
-    # Pobierz dane z Trans.eu
-    transeu_data = get_transeu_data(start_region_id, end_region_id, distance, days)
-    
-    # Agreguj oferty z różnych źródeł
-    all_offers = []
-    
-    # Dodaj oferty TimoCom jeśli są dostępne
-    if timocom_data['has_data']:
-        # Filtruj tylko TimoCom z ofert i dodaj total_offers_sum
-        timocom_offers = [o for o in timocom_data['offers'] if o['exchange'] == 'TimoCom']
-        for offer in timocom_offers:
-            offer['total_offers_sum'] = timocom_data.get('total_offers_sum', 0)
-            offer['records_count'] = timocom_data.get('records_count', 0)
-        all_offers.extend(timocom_offers)
-    else:
-        # Brak danych TimoCom - dodaj placeholder
-        all_offers.append({
-            'exchange': 'TimoCom',
-            'rate_per_km': None,
-            'total_price': None,
-            'currency': 'EUR',
-            'has_data': False,
-            'message': timocom_data.get('message', 'Brak danych'),
-            'total_offers_sum': 0,
-            'records_count': 0
-        })
-    
-    # Dodaj oferty Trans.eu jeśli są dostępne
-    if transeu_data['has_data']:
-        transeu_offers = [o for o in transeu_data['offers'] if o['exchange'] == 'Trans.eu']
-        # Trans.eu nie ma total_offers_sum w bazie
-        for offer in transeu_offers:
-            offer['total_offers_sum'] = 0
-            offer['records_count'] = transeu_data.get('records_count', 0)
-        all_offers.extend(transeu_offers)
-    else:
-        # Brak danych Trans.eu - dodaj placeholder
-        all_offers.append({
-            'exchange': 'Trans.eu',
-            'rate_per_km': None,
-            'total_price': None,
-            'currency': 'EUR',
-            'has_data': False,
-            'message': transeu_data.get('message', 'Brak danych'),
-            'total_offers_sum': 0,
-            'records_count': 0
-        })
-    
-    # Agregacja danych - priorytet dla danych, które faktycznie istnieją
-    has_any_data = timocom_data['has_data'] or transeu_data['has_data']
-    
-    if has_any_data:
-        # Oblicz średnie z dostępnych źródeł
-        rates = []
-        totals = []
-        offers_per_day = []
-        
-        if timocom_data['has_data']:
-            rates.append(timocom_data['average_rate_per_km'])
-            totals.append(timocom_data['average_total_price'])
-            if timocom_data['average_offers_per_day'] is not None:
-                offers_per_day.append(timocom_data['average_offers_per_day'])
-        
-        if transeu_data['has_data']:
-            rates.append(transeu_data['average_rate_per_km'])
-            totals.append(transeu_data['average_total_price'])
-            if transeu_data['average_offers_per_day'] is not None:
-                offers_per_day.append(transeu_data['average_offers_per_day'])
-        
-        avg_rate = sum(rates) / len(rates) if rates else None
-        avg_total = sum(totals) / len(totals) if totals else None
-        avg_offers = sum(offers_per_day) / len(offers_per_day) if offers_per_day else None
-        
-        # Określ źródło danych
-        if timocom_data['has_data'] and transeu_data['has_data']:
-            data_source = 'both'
-        elif timocom_data['has_data']:
-            data_source = 'timocom_only'
-        else:
-            data_source = 'transeu_only'
-        
-        # Pobierz total_offers_sum i records_count z TimoCom (Trans.eu nie ma tych danych)
-        total_offers_sum = timocom_data.get('total_offers_sum', 0) if timocom_data['has_data'] else 0
-        records_count = timocom_data.get('records_count', 0) if timocom_data['has_data'] else 0
-        
-        return {
-            'has_data': True,
-            'offers': all_offers,
-            'average_rate_per_km': round(avg_rate, 2) if avg_rate else None,
-            'average_total_price': round(avg_total, 2) if avg_total else None,
-            'average_offers_per_day': round(avg_offers, 1) if avg_offers else None,
-            'days': days,
-            'data_source': data_source,
-            'timocom_data': timocom_data,
-            'transeu_data': transeu_data,
-            'total_offers_sum': total_offers_sum,
-            'records_count': records_count
-        }
-    else:
-        # Brak danych z żadnego źródła
-        return {
-            'has_data': False,
-            'offers': all_offers,
-            'average_rate_per_km': None,
-            'average_total_price': None,
-            'average_offers_per_day': None,
-            'days': days,
-            'data_source': 'none',
-            'message': 'Brak danych dla tej trasy w wybranym okresie'
-        }
 
-# Funkcja do generowania przykładowych współrzędnych trasy
-def generate_route_coordinates(start_location, end_location):
-    """Generuje przykładowe współrzędne trasy między lokalizacjami"""
-    # Przykładowe współrzędne dla polskich miast
-    cities = {
-        'warszawa': [52.2297, 21.0122],
-        'kraków': [50.0647, 19.9450],
-        'poznań': [52.4064, 16.9252],
-        'wrocław': [51.1079, 17.0385],
-        'gdańsk': [54.3520, 18.6466],
-        'katowice': [50.2649, 19.0238],
-        'łódź': [51.7592, 19.4560],
-        'szczecin': [53.4285, 14.5528],
-        'berlin': [52.5200, 13.4050],
-        'praga': [50.0755, 14.4378],
-        'wiedeń': [48.2082, 16.3738],
-        'budapeszt': [47.4979, 19.0402]
-    }
-    
-    start_coords = cities.get(start_location.lower(), [52.0, 19.0])
-    end_coords = cities.get(end_location.lower(), [50.0, 20.0])
-    
-    # Generowanie punktów pośrednich dla płynniejszej trasy
-    route_points = [start_coords]
-    steps = 5
-    for i in range(1, steps):
-        lat = start_coords[0] + (end_coords[0] - start_coords[0]) * i / steps
-        lng = start_coords[1] + (end_coords[1] - start_coords[1]) * i / steps
-        # Dodanie małego losowego odchylenia dla bardziej realistycznej trasy
-        lat += random.uniform(-0.2, 0.2)
-        lng += random.uniform(-0.2, 0.2)
-        route_points.append([lat, lng])
-    route_points.append(end_coords)
-    
-    return {
-        'start': start_coords,
-        'end': end_coords,
-        'route': route_points
-    }
 
-# Funkcja do generowania przykładowych danych giełdowych
-def generate_exchange_data(distance, days=7):
-    """Generuje przykładowe dane ze stawkami giełdowymi dla określonej liczby dni"""
-    base_rate = random.uniform(0.40, 0.55)  # EUR za km
-    
-    exchanges = ['Trans.eu', 'TimoCom']  # Tylko TimoCom i Trans.eu
-    offers = []
-    
-    # Generuj po jednej ofercie dla każdej giełdy (bez duplikatów)
-    for exchange in exchanges:
-        rate_per_km = base_rate + random.uniform(-0.3, 0.3)
-        total_price = rate_per_km * distance
-        
-        offers.append({
-            'exchange': exchange,
-            'rate_per_km': round(rate_per_km, 2),
-            'total_price': round(total_price, 2),
-            'currency': 'EUR',
-            'date': (datetime.now() - timedelta(days=random.randint(0, days))).strftime('%Y-%m-%d')
-        })
-    
-    avg_rate = sum(o['rate_per_km'] for o in offers) / len(offers)
-    avg_total = sum(o['total_price'] for o in offers) / len(offers)
-    
-    # Oblicz liczbę ofert per dzień dla każdej giełdy
-    for offer in offers:
-        offer['offers_per_day'] = round(random.uniform(0.5, 3.0), 1)
-    
-    # Oblicz średnią liczbę ofert per dzień
-    avg_offers_per_day = sum(o['offers_per_day'] for o in offers) / len(offers)
-    
-    return {
-        'offers': offers,
-        'average_rate_per_km': round(avg_rate, 2),
-        'average_total_price': round(avg_total, 2),
-        'average_offers_per_day': round(avg_offers_per_day, 1),
-        'days': days
-    }
 
-# Funkcja do generowania historycznych danych firmowych
-def generate_historical_data(distance, start_location, end_location, days=7):
-    """Generuje przykładowe dane historyczne firmy dla określonej liczby dni"""
-    # Losowa decyzja czy mamy dane historyczne dla tej trasy
-    has_history = random.choice([True, True, False])
+def _load_postal_code_mapping():
+    """Ładuje mapowanie kodów pocztowych na regiony"""
+    global _POSTAL_CODE_MAPPING
     
-    if not has_history:
-        return {
-            'has_data': False,
-            'orders': [],
-            'average_rate_per_km': None,
-            'average_total_price': None,
-            'orders_per_day': None,
-            'days': days
-        }
-    
-    base_rate = random.uniform(0.45, 0.62)  # Stawki firmowe zwykle trochę wyższe (EUR za km)
-    orders = []
-    
-    # Liczba zleceń zależy od okresu
-    num_orders = min(random.randint(2, 8), days // 3)
-    
-    for i in range(max(2, num_orders)):
-        rate_per_km = base_rate + random.uniform(-0.4, 0.4)
-        total_price = rate_per_km * distance
-        
-        orders.append({
-            'order_id': f'ORD-{random.randint(1000, 9999)}',
-            'date': (datetime.now() - timedelta(days=random.randint(0, days))).strftime('%Y-%m-%d'),
-            'carrier': f'Przewoźnik {random.choice(["A", "B", "C", "D", "E"])} Sp. z o.o.',
-            'rate_per_km': round(rate_per_km, 2),
-            'total_price': round(total_price, 2),
-            'currency': 'EUR'
-        })
-    
-    avg_rate = sum(o['rate_per_km'] for o in orders) / len(orders)
-    avg_total = sum(o['total_price'] for o in orders) / len(orders)
-    
-    # Oblicz liczbę zleceń per dzień
-    orders_per_day = round(len(orders) / days, 1)
-    
-    return {
-        'has_data': True,
-        'orders': orders,
-        'average_rate_per_km': round(avg_rate, 2),
-        'average_total_price': round(avg_total, 2),
-        'orders_per_day': orders_per_day,
-        'days': days
-    }
-
-# Funkcja do generowania danych o opłatach drogowych
-def generate_toll_data(start_location, end_location, distance):
-    """Generuje przykładowe dane o opłatach drogowych"""
-    # Symulacja opłat w zależności od trasy
-    tolls = []
-    
-    # Dodaj opłaty dla tras międzynarodowych
-    countries = []
-    if any(city in start_location.lower() or city in end_location.lower() 
-           for city in ['berlin', 'praga', 'wiedeń', 'budapeszt']):
-        countries = ['Polska', 'Niemcy'] if 'berlin' in (start_location + end_location).lower() else ['Polska']
-    else:
-        countries = ['Polska']
-    
-    total_toll = 0
-    for country in countries:
-        if country == 'Polska':
-            toll_amount = distance * 0.067  # ~0.067 EUR/km dla pojazdów ciężarowych
-            tolls.append({
-                'country': country,
-                'system': 'e-TOLL',
-                'amount': round(toll_amount, 2),
-                'currency': 'EUR'
-            })
-            total_toll += toll_amount
-        elif country == 'Niemcy':
-            toll_amount = distance * 0.19  # ~0.19 EUR/km
-            tolls.append({
-                'country': country,
-                'system': 'Toll Collect',
-                'amount': round(toll_amount, 2),
-                'currency': 'EUR'
-            })
-            total_toll += toll_amount
-    
-    return {
-        'tolls': tolls,
-        'total_toll': round(total_toll, 2),
-        'currency': 'EUR'
-    }
-
-# Funkcja do generowania sugerowanych przewoźników
-def generate_carrier_suggestions(start_location, end_location):
-    """Generuje listę sugerowanych przewoźników"""
-    carrier_names = [
-        'Trans-Logistics', 'Euro-Transport', 'Fast Cargo', 'Reliable Freight',
-        'Express Delivery', 'Safe Transport', 'Quick Route', 'Prime Logistics',
-        'Best Carriers', 'Global Transport'
-    ]
-    
-    # Przewoźnicy historyczni (z którymi firma już współpracowała)
-    historical_carriers = []
-    num_historical = random.randint(2, 4)
-    
-    for i in range(num_historical):
-        historical_carriers.append({
-            'name': f'{random.choice(carrier_names)} Sp. z o.o.',
-            'rating': round(random.uniform(4.0, 5.0), 1),
-            'completed_orders': random.randint(5, 50),
-            'avg_rate_per_km': round(random.uniform(0.49, 0.62), 2),
-            'reliability': random.choice(['Wysoka', 'Bardzo wysoka']),
-            'contact': f'+48 {random.randint(500, 799)} {random.randint(100, 999)} {random.randint(100, 999)}'
-        })
-    
-    # Przewoźnicy z giełdy
-    exchange_carriers = []
-    num_exchange = random.randint(3, 6)
-    
-    for i in range(num_exchange):
-        exchange_carriers.append({
-            'name': f'{random.choice(carrier_names)} S.A.',
-            'rating': round(random.uniform(3.5, 4.8), 1),
-            'available_trucks': random.randint(1, 5),
-            'avg_rate_per_km': round(random.uniform(0.40, 0.55), 2),
-            'exchange': random.choice(['Trans.eu', 'TimoCom']),
-            'response_time': f'{random.randint(1, 24)}h'
-        })
-    
-    return {
-        'historical': historical_carriers,
-        'exchange': exchange_carriers
-    }
-
-@app.route('/')
-def index():
-    """Strona główna aplikacji"""
-    return render_template('index.html')
-
-@app.route('/api-test')
-def api_test():
-    """Strona testowa dla API wyceny tras"""
-    return render_template('api_test.html')
-
-@app.route('/api/calculate', methods=['POST'])
-def calculate_route():
-    """Endpoint do wyceny trasy"""
-    data = request.json
-    start_location = data.get('start_location', '')
-    end_location = data.get('end_location', '')
-    start_location_raw = data.get('start_location_raw', start_location)  # Faktyczny kod wpisany przez użytkownika
-    end_location_raw = data.get('end_location_raw', end_location)  # Faktyczny kod wpisany przez użytkownika
-    vehicle_type = data.get('vehicle_type', 'naczepa')
-    body_type = data.get('body_type', 'standard')
-    start_coords = data.get('start_coords')
-    end_coords = data.get('end_coords')
-    calculated_distance = data.get('calculated_distance')
-    
-    if not start_location or not end_location:
-        return jsonify({'error': 'Brak wymaganych lokalizacji'}), 400
-    
-    # Użyj obliczonej odległości z frontendu lub wygeneruj dane trasy
-    if start_coords and end_coords and calculated_distance:
-        # Użyj rzeczywistych współrzędnych
-        route_data = {
-            'start': start_coords,
-            'end': end_coords,
-            'route': [start_coords, end_coords]  # Prosta linia między punktami
-        }
-        distance = calculated_distance
-    else:
-        # Fallback do starej metody
-        route_data = generate_route_coordinates(start_location, end_location)
-        distance = random.randint(200, 800)
-    
-    # Pobierz ID regionów (jeśli dostępne)
-    start_region_id = data.get('start_region_id')
-    end_region_id = data.get('end_region_id')
-    
-    # Pobierz liczbę dni z zapytania (domyślnie 7)
-    days = data.get('days', 7)
-    
-    # Generowanie/pobieranie danych dla wybranego okresu
-    # Jeśli mamy ID regionów, użyj faktycznych danych z bazy, w przeciwnym razie losowe
-    if start_region_id and end_region_id:
-        print(f"📊 Pobieranie danych z bazy dla regionów: {start_region_id} -> {end_region_id}")
-        exchange_data = get_aggregated_exchange_data(start_region_id, end_region_id, distance, days)
-        exchange_data_7 = get_aggregated_exchange_data(start_region_id, end_region_id, distance, 7)
-        exchange_data_30 = get_aggregated_exchange_data(start_region_id, end_region_id, distance, 30)
-        exchange_data_90 = get_aggregated_exchange_data(start_region_id, end_region_id, distance, 90)
-    else:
-        print("⚠ Brak ID regionów - używam losowych danych")
-        exchange_data = generate_exchange_data(distance, days)
-        exchange_data_7 = generate_exchange_data(distance, 7)
-        exchange_data_30 = generate_exchange_data(distance, 30)
-        exchange_data_90 = generate_exchange_data(distance, 90)
-    
-    historical_data = generate_historical_data(distance, start_location, end_location, days)
-    toll_data = generate_toll_data(start_location, end_location, distance)
-    carriers = generate_carrier_suggestions(start_location, end_location)
-    
-    historical_data_7 = generate_historical_data(distance, start_location, end_location, 7)
-    historical_data_30 = generate_historical_data(distance, start_location, end_location, 30)
-    historical_data_90 = generate_historical_data(distance, start_location, end_location, 90)
-    
-    # Pobierz metodę obliczania dystansu z zapytania (jeśli dostępna)
-    distance_method = data.get('distance_method', 'unknown')
-    haversine_distance = data.get('haversine_distance')
-    
-    result = {
-        'route': route_data,
-        'distance': distance,
-        'distance_method': distance_method,  # 'aws', 'haversine', 'haversine_fallback'
-        'haversine_distance': haversine_distance,  # Oryginalny dystans Haversine dla porównania
-        'start_location': start_location,
-        'end_location': end_location,
-        'start_location_raw': start_location_raw,
-        'end_location_raw': end_location_raw,
-        'start_coords': start_coords,  # Współrzędne dla API giełd
-        'end_coords': end_coords,
-        'vehicle_type': vehicle_type,
-        'body_type': body_type,
-        'exchange_rates': exchange_data,
-        'historical_rates': historical_data,
-        'tolls': toll_data,
-        'suggested_carriers': carriers,
-        # Dane dla wszystkich okresów
-        'exchange_rates_by_days': {
-            '7': exchange_data_7,
-            '30': exchange_data_30,
-            '90': exchange_data_90
-        },
-        'historical_rates_by_days': {
-            '7': historical_data_7,
-            '30': historical_data_30,
-            '90': historical_data_90
-        }
-    }
-    
-    return jsonify(result)
-
-@app.route('/api/current-offers', methods=['POST'])
-def get_current_freight_offers():
-    """
-    Endpoint do pobierania aktualnych ofert z API giełd (tryb 'teraz')
-    Używa realnych adresów zamiast ID regionów
-    """
-    data = request.json
-    
-    # Pobierz parametry
-    start_location = data.get('start_location')  # Znormalizowany (np. "Wrocław, Poland")
-    end_location = data.get('end_location')
-    start_location_raw = data.get('start_location_raw')  # Raw input (np. "pl00")
-    end_location_raw = data.get('end_location_raw')
-    start_coords = data.get('start_coords')  # [lat, lng]
-    end_coords = data.get('end_coords')  # [lat, lng]
-    distance = data.get('distance', 0)
-    
-    if not start_location or not end_location:
-        return jsonify({'error': 'Brak adresów start/end'}), 400
-    
-    # Użyj znormalizowanych adresów dla API
-    start_for_api = start_location
-    end_for_api = end_location
-    
-    print(f"\n🌐 API Current Offers - tryb TERAZ")
-    print(f"   Start: {start_for_api} (coords: {start_coords})")
-    print(f"   Cel: {end_for_api} (coords: {end_coords})")
-    print(f"   Dystans: {distance} km")
+    if _POSTAL_CODE_MAPPING is not None:
+        return _POSTAL_CODE_MAPPING
     
     try:
-        # Pobierz aktualne oferty z API giełd - przekaż również współrzędne
-        offers_data = get_current_offers(
-            start_for_api,
-            end_for_api,
-            distance,
-            start_coords=start_coords,
-            end_coords=end_coords
-        )
-        
-        return jsonify({
-            'success': True,
-            'data': offers_data
-        })
-        
+        mapping_path = os.path.join(os.path.dirname(__file__), 'data', 'postal_code_to_region_transeu.json')
+        with open(mapping_path, 'r', encoding='utf-8') as f:
+            _POSTAL_CODE_MAPPING = json.load(f)
+        logger.info(f"✅ Loaded postal code mapping ({len(_POSTAL_CODE_MAPPING)} codes)")
     except Exception as e:
-        print(f"❌ Błąd pobierania aktualnych ofert: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'data': {
-                'has_data': False,
-                'offers': [],
-                'message': f'Błąd połączenia z API giełd: {str(e)}'
-            }
-        }), 500
+        logger.error(f"❌ Failed to load postal code mapping: {e}")
+        _POSTAL_CODE_MAPPING = {}
+    
+    return _POSTAL_CODE_MAPPING
+
+def postal_code_to_region_id(postal_code: str) -> Optional[int]:
+    """Konwertuje kod pocztowy (np. PL50) na region ID"""
+    mapping = _load_postal_code_mapping()
+    normalized = postal_code.upper().replace(' ', '').replace('-', '')
+    
+    if normalized in mapping:
+        return mapping[normalized]['region_id']
+    
+    return None
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint - dostępny bez API key"""
+    return jsonify({
+        'status': 'ok',
+        'service': 'Pricing API (Secured)',
+        'version': '1.1.0'
+    })
+
 
 @app.route('/api/route-pricing', methods=['POST'])
+@require_api_key
+@limiter.limit("5 per minute")  # Max 5 requestów na minutę
 def get_route_pricing():
+    """Pobierz dane cenowe dla trasy
+    Endpoint do pobierania historycznych danych cenowych dla określonej trasy na podstawie kodów pocztowych.
+    ---
+    tags:
+      - Pricing
+    consumes:
+      - application/json
+    produces:
+      - application/json
+    security:
+      - ApiKeyAuth: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          id: PricingRequest
+          type: object
+          properties:
+            start_postal_code:
+              type: string
+              description: Kod pocztowy miejsca początkowego (np. "DE49").
+              example: "DE49"
+            end_postal_code:
+              type: string
+              description: Kod pocztowy miejsca docelowego (np. "PL20").
+              example: "PL20"
+          required:
+            - start_postal_code
+            - end_postal_code
+    responses:
+      200:
+        description: Sukces - dane cenowe zostały zwrócone.
+        schema:
+          id: PricingResponse
+          type: object
+          properties:
+            success:
+              type: boolean
+              example: true
+            data:
+              type: object
+              properties:
+                start_postal_code:
+                  type: string
+                end_postal_code:
+                  type: string
+                pricing:
+                  type: object
+                  description: Obiekt zawierający dane cenowe z różnych źródeł i okresów.
+      400:
+        description: Błąd zapytania - brakujące lub nieprawidłowe dane wejściowe.
+      401:
+        description: Nieautoryzowany - brak klucza API.
+      403:
+        description: Zabroniony - nieprawidłowy klucz API lub wymagane HTTPS.
+      404:
+        description: Nie znaleziono - brak danych dla podanej trasy lub kodów pocztowych.
+      429:
+        description: Przekroczono limit zapytań.
+      500:
+        description: Wewnętrzny błąd serwera.
     """
-    Endpoint do pobierania cen dla trasy na podstawie kodów pocztowych
-    
-    Request JSON:
-    {
-        "start_postal_code": "50-340",
-        "end_postal_code": "08034",
-        "vehicle_type": "naczepa"  // naczepa, 3.5t, 12t, lorry, solo, bus, double_trailer
-    }
-    
-    Response JSON:
-    {
-        "success": true,
-        "data": {
-            "start_postal_code": "50-340",
-            "end_postal_code": "08034",
-            "vehicle_type": "naczepa",
-            "distance_km": 955.63,
-            "pricing": {
-                "timocom": {
-                    "avg_7d": 1.0,
-                    "avg_30d": 1.04,
-                    "avg_90d": 1.07,
-                    "median_7d": 1.05,
-                    "median_30d": 1.05,
-                    "median_90d": 1.08,
-                    "offers_7d": 4012,
-                    "offers_30d": 24835,
-                    "offers_90d": 29253
-                },
-                "transeu": {
-                    "avg_7d": 0.96,
-                    "avg_30d": 0.87,
-                    "avg_90d": 1.1,
-                    ...
-                }
-            }
-        }
-    }
-    """
-    global _PRICING_DATA_CACHE
-    
     try:
         data = request.json
-        start_postal = data.get('start_postal_code', '').strip()
-        end_postal = data.get('end_postal_code', '').strip()
-        vehicle_type = data.get('vehicle_type', 'naczepa').lower()
         
-        if not start_postal or not end_postal:
+        if not data:
+            logger.warning(f"⚠️ Empty JSON from {request.remote_addr}")
             return jsonify({
                 'success': False,
-                'error': 'Brak kodów pocztowych (start_postal_code i end_postal_code wymagane)'
+                'error': 'Brak danych JSON w request'
             }), 400
         
-        # Załaduj dane CSV (z cache)
-        if _PRICING_DATA_CACHE is None:
-            print(f"📂 Ładowanie danych cenowych z CSV: {_CSV_FILE_PATH}")
-            _PRICING_DATA_CACHE = pd.read_csv(
-                _CSV_FILE_PATH,
-                sep=';',
-                encoding='utf-8',
-                low_memory=False
-            )
-            print(f"✓ Załadowano {len(_PRICING_DATA_CACHE)} tras")
+        start_postal = data.get('start_postal_code', '').strip().upper()
+        end_postal = data.get('end_postal_code', '').strip().upper()
+        distance = data.get('dystans')
         
-        df = _PRICING_DATA_CACHE
+        if not all([start_postal, end_postal, distance]):
+            return jsonify({
+                'success': False,
+                'error': 'Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans'
+            }), 400
         
-        # Znajdź trasę po kodach pocztowych
-        # Normalizacja kodów pocztowych - usuń spacje i myślniki
-        def normalize_postal(postal):
-            if pd.isna(postal):
-                return ''
-            return str(postal).replace(' ', '').replace('-', '').strip()
+        # Walidacja formatów kodów pocztowych
+        if not validate_postal_code(start_postal):
+            logger.warning(f"⚠️ Invalid start postal code: {start_postal}")
+            return jsonify({
+                'success': False,
+                'error': f'Nieprawidłowy format kodu pocztowego: {start_postal}',
+                'message': 'Użyj formatu: KOD_KRAJU (2 litery) + cyfry (np. PL50, DE10)'
+            }), 400
         
-        start_normalized = normalize_postal(start_postal)
-        end_normalized = normalize_postal(end_postal)
+        if not validate_postal_code(end_postal):
+            logger.warning(f"⚠️ Invalid end postal code: {end_postal}")
+            return jsonify({
+                'success': False,
+                'error': f'Nieprawidłowy format kodu pocztowego: {end_postal}',
+                'message': 'Użyj formatu: KOD_KRAJU (2 litery) + cyfry (np. PL50, DE10)'
+            }), 400
         
-        # Szukaj w kolumnach Origin 2 Zip i Destination 2 Zip
-        mask = (
-            df['Origin 2 Zip'].apply(normalize_postal) == start_normalized
-        ) & (
-            df['Destination 2 Zip'].apply(normalize_postal) == end_normalized
-        )
+        # Konwertuj kody pocztowe na region IDs
+        start_region_id = postal_code_to_region_id(start_postal)
+        end_region_id = postal_code_to_region_id(end_postal)
         
-        matching_routes = df[mask]
+        if not start_region_id or not end_region_id:
+            missing = []
+            if not start_region_id:
+                missing.append(start_postal)
+            if not end_region_id:
+                missing.append(end_postal)
+            
+            logger.info(f"ℹ️ Region not found for: {', '.join(missing)}")
+            return jsonify({
+                'success': False,
+                'error': f'Nie znaleziono regionu dla kodów: {", ".join(missing)}',
+                'message': 'Użyj formatu: KOD_KRAJU + 2 cyfry (np. PL50, DE10, FR75)'
+            }), 404
         
-        if len(matching_routes) == 0:
+        logger.info(f"📊 Processing pricing request: {start_postal}({start_region_id}) -> {end_postal}({end_region_id})")
+        
+        request_start = time.time()
+        
+        # OPTYMALIZACJA: Pobierz tylko dane z 30 dni TimoCom (to jedyne, które używamy)
+        timocom_start = time.time()
+        timocom_30d = get_timocom_pricing(start_region_id, end_region_id, days=30)
+        logger.info(f"⏱️ Zapytanie TimoCom 30d: {(time.time() - timocom_start)*1000:.0f}ms")
+        
+        # Sprawdź czy są dane
+        if not timocom_30d:
+            logger.info(f"ℹ️ No data found for route: {start_postal} -> {end_postal}")
             return jsonify({
                 'success': False,
                 'error': f'Brak danych dla trasy {start_postal} -> {end_postal}',
-                'message': 'Nie znaleziono trasy w bazie danych'
+                'message': 'Nie znaleziono danych cenowych w bazie dla tej trasy'
             }), 404
-        
-        # Pobierz pierwszy matching route (powinien być tylko jeden)
-        route = matching_routes.iloc[0]
-        
-        # Mapowanie typów pojazdów na prefiksy kolumn
-        vehicle_mapping = {
-            'naczepa': 'TC Naczepa',
-            'trailer': 'TC Naczepa',
-            '3.5t': 'TC 3.5t',
-            '3_5t': 'TC 3.5t',
-            '12t': 'TC 12t',
-            'lorry': 'TE Lorry',
-            'solo': 'TE Solo',
-            'bus': 'TE Bus',
-            'double_trailer': 'TE DblTrailer',
-            'dbl_trailer': 'TE DblTrailer'
-        }
-        
-        column_prefix = vehicle_mapping.get(vehicle_type)
-        
-        if not column_prefix:
+
+        # Sprawdź czy mamy kompletne dane
+        if 'avg_price_per_km' not in timocom_30d:
             return jsonify({
                 'success': False,
-                'error': f'Nieznany typ pojazdu: {vehicle_type}',
-                'available_types': list(vehicle_mapping.keys())
-            }), 400
-        
-        # Pobierz dane cenowe dla wybranego typu pojazdu
-        pricing_data = {}
-        
-        # Określ źródło (TimoCom lub Trans.eu)
-        source = 'timocom' if column_prefix.startswith('TC') else 'transeu'
-        
-        # Pobierz wszystkie dostępne metryki
-        metrics = {}
-        
-        # Średnie
-        for period in ['7d', '30d', '90d']:
-            col_name = f"{column_prefix} Avg {period}"
-            if col_name in route:
-                value = route[col_name]
-                if pd.notna(value) and value != '':
-                    try:
-                        metrics[f'avg_{period}'] = float(value)
-                    except (ValueError, TypeError):
-                        metrics[f'avg_{period}'] = None
-                else:
-                    metrics[f'avg_{period}'] = None
-        
-        # Mediany
-        for period in ['7d', '30d', '90d']:
-            col_name = f"{column_prefix} Median {period}"
-            if col_name in route:
-                value = route[col_name]
-                if pd.notna(value) and value != '':
-                    try:
-                        metrics[f'median_{period}'] = float(value)
-                    except (ValueError, TypeError):
-                        metrics[f'median_{period}'] = None
-                else:
-                    metrics[f'median_{period}'] = None
-        
-        # Liczba ofert
-        for period in ['7d', '30d', '90d']:
-            col_name = f"{column_prefix} Oferty {period}"
-            if col_name in route:
-                value = route[col_name]
-                if pd.notna(value) and value != '':
-                    try:
-                        metrics[f'offers_{period}'] = int(float(value))
-                    except (ValueError, TypeError):
-                        metrics[f'offers_{period}'] = None
-                else:
-                    metrics[f'offers_{period}'] = None
-        
-        pricing_data[source] = metrics
-        
-        # Pobierz dystans
-        distance_km = None
-        if 'Dystans [km]' in route:
-            try:
-                distance_km = float(route['Dystans [km]'])
-            except (ValueError, TypeError):
-                pass
-        
-        # Pobierz dodatkowe informacje o trasie
-        route_info = {
-            'lane_name': route.get('Lane Name', 'N/A'),
-            'origin': route.get('Origin', 'N/A'),
-            'origin_country': route.get('Origin Country', 'N/A'),
-            'destination_country': route.get('Destination Country', 'N/A'),
-            'historic_potential': route.get('Historic/Potential', 'N/A')
-        }
-        
+                'error': 'Brak wystarczających danych z 30 dni do obliczenia ceny'
+            }), 404
+
+        calc_start = time.time()
+        avg_rates = timocom_30d['avg_price_per_km']
+        calculated_prices = {}
+        for vehicle, rate in avg_rates.items():
+            # Zmieniamy klucze, aby pasowały do oczekiwań (bus, solo, naczepa)
+            vehicle_key = vehicle
+            if vehicle == 'trailer':
+                vehicle_key = 'naczepa'
+            elif vehicle == '3_5t':
+                vehicle_key = 'bus'
+            elif vehicle == '12t':
+                vehicle_key = 'solo'
+
+            if rate is not None:
+                calculated_prices[f'cena_{vehicle_key}'] = round(rate * float(distance), 2)
+            else:
+                calculated_prices[f'cena_{vehicle_key}'] = None
+        logger.info(f"⏱️ Obliczenia cen: {(time.time() - calc_start)*1000:.0f}ms")
+        logger.info(f"⏱️ ⭐ CAŁKOWITY CZAS REQUESTU: {(time.time() - request_start)*1000:.0f}ms")
+        logger.info(f"✅ Successfully returned calculated prices for {start_postal} -> {end_postal}")
+
         return jsonify({
             'success': True,
             'data': {
                 'start_postal_code': start_postal,
                 'end_postal_code': end_postal,
-                'vehicle_type': vehicle_type,
-                'distance_km': distance_km,
-                'pricing': pricing_data,
-                'route_info': route_info,
-                'currency': 'EUR',
-                'unit': 'EUR/km'
+                'distance_km': distance,
+                'calculated_prices': calculated_prices,
+                'currency': 'EUR'
             }
         })
         
-    except FileNotFoundError:
-        return jsonify({
-            'success': False,
-            'error': 'Plik z danymi cenowymi nie został znaleziony',
-            'file_path': _CSV_FILE_PATH
-        }), 500
     except Exception as e:
-        print(f"❌ Błąd w /api/route-pricing: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"❌ Server error: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': f'Błąd serwera: {str(e)}'
+            'error': 'Błąd serwera'
         }), 500
 
-@app.route('/api/calculate-distance', methods=['POST'])
-def calculate_distance():
-    """
-    Endpoint do obliczania rzeczywistego dystansu drogowego przez AWS Location Service API
-    Zwraca dystans w kilometrach, opcjonalnie geometrię trasy, lub fallback do Haversine
-    """
-    print("\n" + "="*60)
-    print("🔵 WYWOŁANO /api/calculate-distance")
-    print("="*60)
-    
-    data = request.json
-    print(f"📥 Otrzymane dane: {data}")
-    
-    start_coords = data.get('start_coords')  # [lat, lng]
-    end_coords = data.get('end_coords')      # [lat, lng]
-    fallback_distance = data.get('fallback_distance')  # Haversine z frontendu
-    include_geometry = data.get('include_geometry', False)  # Czy zwrócić geometrię trasy
-    
-    if not start_coords or not end_coords:
-        print("❌ BŁĄD: Brak współrzędnych")
-        return jsonify({'error': 'Brak współrzędnych'}), 400
-    
-    start_lat, start_lng = start_coords
-    end_lat, end_lng = end_coords
-    
-    print(f"\n📏 Obliczanie dystansu AWS (geometry={include_geometry}):")
-    print(f"   Start: [{start_lat}, {start_lng}]")
-    print(f"   Cel: [{end_lat}, {end_lng}]")
-    print(f"   Fallback distance: {fallback_distance} km")
-    print(f"   AWS_LOCATION_API_KEY set: {bool(AWS_LOCATION_API_KEY)}")
-    if AWS_LOCATION_API_KEY:
-        print(f"   AWS_LOCATION_API_KEY prefix: {AWS_LOCATION_API_KEY[:20]}...")
-    print(f"   AWS_REGION: {AWS_REGION}")
-    
-    # Wywołaj AWS API z możliwością pobrania geometrii
-    aws_result = get_aws_route_distance(start_lat, start_lng, end_lat, end_lng, 
-                                       return_geometry=include_geometry)
-    
-    if aws_result is not None:
-        # Sukces - użyj dystansu AWS
-        response_data = {
-            'success': True,
-            'distance': aws_result['distance'],
-            'method': 'aws',
-            'fallback_distance': fallback_distance
-        }
-        
-        # Dodaj geometrię jeśli była pobrana
-        if include_geometry and 'geometry' in aws_result:
-            response_data['geometry'] = aws_result['geometry']
-            response_data['duration'] = aws_result.get('duration', 0)
-            print(f"   ✅ SUKCES: Dystans AWS: {aws_result['distance']} km, Punkty: {len(aws_result['geometry'])}")
-        else:
-            print(f"   ✅ SUKCES: Dystans AWS: {aws_result['distance']} km")
-        
-        print(f"📤 Zwracam response: method=aws, distance={aws_result['distance']}")
-        print("="*60 + "\n")
-        return jsonify(response_data)
-    else:
-        # Błąd AWS - użyj fallback (Haversine)
-        print(f"   ⚠️  AWS zwrócił None - używam fallback")
-        print(f"   ⚠️  Fallback do Haversine: {fallback_distance} km")
-        print(f"📤 Zwracam response: method=haversine_fallback, distance={fallback_distance}")
-        print("="*60 + "\n")
-        return jsonify({
-            'success': True,
-            'distance': fallback_distance,
-            'method': 'haversine_fallback',
-            'message': 'AWS API niedostępny - użyto Haversine'
-        })
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    """Handler dla rate limit errors"""
+    logger.warning(f"⚠️ Rate limit exceeded from {request.remote_addr}")
+    return jsonify({
+        'success': False,
+        'error': 'Rate limit exceeded',
+        'message': 'Przekroczono limit requestów. Spróbuj ponownie później.'
+    }), 429
+
 
 if __name__ == '__main__':
-    # Pobierz port z zmiennej środowiskowej (dla Render) lub użyj 5000 lokalnie
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 5003))
+    logger.info(f"🚀 Starting Pricing API (Secured) on port {port}")
+    logger.info(f"🔒 Environment: {ENV}")
+    logger.info(f"🌐 Allowed origins: {ALLOWED_ORIGINS}")
     app.run(debug=False, host='0.0.0.0', port=port)

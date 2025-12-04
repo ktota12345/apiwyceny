@@ -18,6 +18,7 @@ from functools import wraps
 import secrets
 import re
 import logging
+import time
 
 # Konfiguracja logowania
 logging.basicConfig(
@@ -30,6 +31,18 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
+
+# STARTUP LOG - WERSJA Z OPTYMALIZACJĄ (1 zapytanie zamiast 6)
+print("""
+**********************************************
+*                                            *
+*   SECURED & OPTIMIZED PRICING API v2.0    *
+*   - Single query optimization             *
+*   - Connection pooling with validation    *
+*   - Performance monitoring                *
+*                                            *
+**********************************************
+""")
 
 # Konfiguracja Swaggera
 app.config['SWAGGER'] = {
@@ -96,7 +109,9 @@ try:
         user=DB_USER,
         password=DB_PASSWORD,
         database=DB_NAME,
-        cursor_factory=RealDictCursor
+        cursor_factory=RealDictCursor,
+        connect_timeout=10,
+        options='-c statement_timeout=30000'  # 30 sekund timeout dla zapytań
     )
     logger.info("✅ Connection pool initialized")
 except Exception as e:
@@ -109,6 +124,16 @@ _POSTAL_CODE_MAPPING = None
 
 # Regex dla walidacji kodu pocztowego (2 litery + 1-5 cyfr)
 POSTAL_CODE_PATTERN = re.compile(r'^[A-Z]{2}\d{1,5}$')
+
+
+@app.after_request
+def add_security_headers(response):
+    """Dodaje security headers do każdej odpowiedzi"""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
 
 
 @app.before_request
@@ -172,12 +197,27 @@ def validate_postal_code(postal_code: str) -> bool:
 
 
 def _get_db_connection():
-    """Pobiera połączenie z pool"""
+    """Pobiera połączenie z pool i weryfikuje, czy jest aktywne"""
     if connection_pool is None:
         raise Exception("Connection pool not initialized")
     
     try:
         conn = connection_pool.getconn()
+        
+        # Sprawdź czy połączenie jest aktywne
+        try:
+            with conn.cursor() as test_cursor:
+                test_cursor.execute('SELECT 1')
+        except Exception as e:
+            logger.warning(f"⚠️ Stale connection detected, reconnecting: {e}")
+            # Jeśli połączenie martwe, zamknij i pobierz nowe
+            try:
+                conn.close()
+            except:
+                pass
+            connection_pool.putconn(conn, close=True)
+            conn = connection_pool.getconn()
+        
         return conn
     except Exception as e:
         logger.error(f"❌ Failed to get connection from pool: {e}")
@@ -218,12 +258,16 @@ def map_transeu_to_timocom_id(transeu_id: int) -> int:
 
 def get_timocom_pricing(start_region_id: int, end_region_id: int, days: int = 7):
     """Pobiera dane cenowe TimoCom z bazy danych PostgreSQL"""
+    start_time = time.time()
+    
     timocom_start_id = map_transeu_to_timocom_id(start_region_id)
     timocom_end_id = map_transeu_to_timocom_id(end_region_id)
     
     conn = None
     try:
+        conn_start = time.time()
         conn = _get_db_connection()
+        logger.info(f"⏱️ Połączenie z bazą: {(time.time() - conn_start)*1000:.0f}ms")
         
         with conn.cursor() as cur:
             query = """
@@ -243,8 +287,10 @@ def get_timocom_pricing(start_region_id: int, end_region_id: int, days: int = 7)
                   AND o.enlistment_date >= CURRENT_DATE - CAST(%s AS INTEGER);
             """
             
+            query_start = time.time()
             cur.execute(query, (timocom_start_id, timocom_end_id, days))
             result = cur.fetchone()
+            logger.info(f"⏱️ Zapytanie SQL ({days}d): {(time.time() - query_start)*1000:.0f}ms")
             
             if not result or (not result['avg_trailer_price'] and not result['avg_3_5t_price'] and not result['avg_12t_price']):
                 return None
@@ -275,6 +321,7 @@ def get_timocom_pricing(start_region_id: int, end_region_id: int, days: int = 7)
     finally:
         if conn:
             _return_db_connection(conn)
+        logger.info(f"⏱️ CAŁKOWITY CZAS get_timocom_pricing ({days}d): {(time.time() - start_time)*1000:.0f}ms")
 
 
 def get_transeu_pricing(start_region_id: int, end_region_id: int, days: int = 7):
@@ -321,6 +368,8 @@ def get_transeu_pricing(start_region_id: int, end_region_id: int, days: int = 7)
             _return_db_connection(conn)
 
 
+
+
 def _load_postal_code_mapping():
     """Ładuje mapowanie kodów pocztowych na regiony"""
     global _POSTAL_CODE_MAPPING
@@ -338,7 +387,6 @@ def _load_postal_code_mapping():
         _POSTAL_CODE_MAPPING = {}
     
     return _POSTAL_CODE_MAPPING
-
 
 def postal_code_to_region_id(postal_code: str) -> Optional[int]:
     """Konwertuje kod pocztowy (np. PL50) na region ID"""
@@ -361,10 +409,10 @@ def health_check():
     })
 
 
-@app.route('/api/pricing', methods=['POST'])
+@app.route('/api/route-pricing', methods=['POST'])
 @require_api_key
 @limiter.limit("5 per minute")  # Max 5 requestów na minutę
-def get_pricing():
+def get_route_pricing():
     """Pobierz dane cenowe dla trasy
     Endpoint do pobierania historycznych danych cenowych dla określonej trasy na podstawie kodów pocztowych.
     ---
@@ -440,11 +488,12 @@ def get_pricing():
         
         start_postal = data.get('start_postal_code', '').strip().upper()
         end_postal = data.get('end_postal_code', '').strip().upper()
+        distance = data.get('dystans')
         
-        if not start_postal or not end_postal:
+        if not all([start_postal, end_postal, distance]):
             return jsonify({
                 'success': False,
-                'error': 'Brak kodów pocztowych (start_postal_code i end_postal_code wymagane)'
+                'error': 'Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans'
             }), 400
         
         # Walidacja formatów kodów pocztowych
@@ -484,52 +533,58 @@ def get_pricing():
         
         logger.info(f"📊 Processing pricing request: {start_postal}({start_region_id}) -> {end_postal}({end_region_id})")
         
-        # Pobierz ceny dla różnych okresów
-        pricing_data = {
-            'timocom': {},
-            'transeu': {}
-        }
+        request_start = time.time()
         
-        # TimoCom - 7, 30, 90 dni
-        for days in [7, 30, 90]:
-            timocom_data = get_timocom_pricing(start_region_id, end_region_id, days)
-            if timocom_data:
-                pricing_data['timocom'][f'{days}d'] = timocom_data
+        # OPTYMALIZACJA: Pobierz tylko dane z 30 dni TimoCom (to jedyne, które używamy)
+        timocom_start = time.time()
+        timocom_30d = get_timocom_pricing(start_region_id, end_region_id, days=30)
+        logger.info(f"⏱️ Zapytanie TimoCom 30d: {(time.time() - timocom_start)*1000:.0f}ms")
         
-        # Trans.eu - 7, 30, 90 dni
-        for days in [7, 30, 90]:
-            transeu_data = get_transeu_pricing(start_region_id, end_region_id, days)
-            if transeu_data:
-                pricing_data['transeu'][f'{days}d'] = transeu_data
-        
-        # Sprawdź czy są jakiekolwiek dane
-        has_timocom_data = len(pricing_data['timocom']) > 0
-        has_transeu_data = len(pricing_data['transeu']) > 0
-        
-        if not has_timocom_data and not has_transeu_data:
+        # Sprawdź czy są dane
+        if not timocom_30d:
             logger.info(f"ℹ️ No data found for route: {start_postal} -> {end_postal}")
             return jsonify({
                 'success': False,
                 'error': f'Brak danych dla trasy {start_postal} -> {end_postal}',
                 'message': 'Nie znaleziono danych cenowych w bazie dla tej trasy'
             }), 404
-        
-        logger.info(f"✅ Successfully returned pricing data for {start_postal} -> {end_postal}")
-        
+
+        # Sprawdź czy mamy kompletne dane
+        if 'avg_price_per_km' not in timocom_30d:
+            return jsonify({
+                'success': False,
+                'error': 'Brak wystarczających danych z 30 dni do obliczenia ceny'
+            }), 404
+
+        calc_start = time.time()
+        avg_rates = timocom_30d['avg_price_per_km']
+        calculated_prices = {}
+        for vehicle, rate in avg_rates.items():
+            # Zmieniamy klucze, aby pasowały do oczekiwań (bus, solo, naczepa)
+            vehicle_key = vehicle
+            if vehicle == 'trailer':
+                vehicle_key = 'naczepa'
+            elif vehicle == '3_5t':
+                vehicle_key = 'bus'
+            elif vehicle == '12t':
+                vehicle_key = 'solo'
+
+            if rate is not None:
+                calculated_prices[f'cena_{vehicle_key}'] = round(rate * float(distance), 2)
+            else:
+                calculated_prices[f'cena_{vehicle_key}'] = None
+        logger.info(f"⏱️ Obliczenia cen: {(time.time() - calc_start)*1000:.0f}ms")
+        logger.info(f"⏱️ ⭐ CAŁKOWITY CZAS REQUESTU: {(time.time() - request_start)*1000:.0f}ms")
+        logger.info(f"✅ Successfully returned calculated prices for {start_postal} -> {end_postal}")
+
         return jsonify({
             'success': True,
             'data': {
                 'start_postal_code': start_postal,
                 'end_postal_code': end_postal,
-                'start_region_id': start_region_id,
-                'end_region_id': end_region_id,
-                'pricing': pricing_data,
-                'currency': 'EUR',
-                'unit': 'EUR/km',
-                'data_sources': {
-                    'timocom': has_timocom_data,
-                    'transeu': has_transeu_data
-                }
+                'distance_km': distance,
+                'calculated_prices': calculated_prices,
+                'currency': 'EUR'
             }
         })
         
@@ -553,7 +608,7 @@ def ratelimit_handler(e):
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5001))
+    port = int(os.environ.get('PORT', 5003))
     logger.info(f"🚀 Starting Pricing API (Secured) on port {port}")
     logger.info(f"🔒 Environment: {ENV}")
     logger.info(f"🌐 Allowed origins: {ALLOWED_ORIGINS}")
