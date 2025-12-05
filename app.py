@@ -405,11 +405,12 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'service': 'Pricing API (Secured & Optimized)',
-        'version': '2.0.0',
+        'version': '2.1.0',
         'features': {
             'security': 'API Key + Rate Limiting + HTTPS',
-            'optimization': 'Single query (6x faster)',
-            'monitoring': 'Performance metrics enabled'
+            'optimization': '2 queries only (TimoCom + Trans.eu 30d)',
+            'monitoring': 'Performance metrics enabled',
+            'data': 'Returns avg rates EUR/km from both exchanges'
         }
     })
 
@@ -418,9 +419,9 @@ def health_check():
 @require_api_key
 @limiter.limit("5 per minute")  # Max 5 requestów na minutę
 def get_route_pricing():
-    """Pobierz wycenę trasy transportowej
-    Endpoint do obliczania ceny transportu na podstawie kodów pocztowych i dystansu.
-    Używa danych historycznych z TimoCom (średnia z 30 dni) dla trzech typów pojazdów.
+    """Pobierz dane cenowe dla trasy transportowej
+    Endpoint do pobierania średnich stawek transportowych z giełd TimoCom i Trans.eu.
+    Zwraca średnie stawki EUR/km z ostatnich 30 dni dla różnych typów pojazdów.
     ---
     tags:
       - Pricing
@@ -460,7 +461,7 @@ def get_route_pricing():
               minimum: 1
     responses:
       200:
-        description: Sukces - obliczone ceny dla wszystkich typów pojazdów
+        description: Sukces - średnie stawki z 30 dni dla wszystkich typów pojazdów z obu giełd
         schema:
           id: PricingResponse
           type: object
@@ -479,45 +480,106 @@ def get_route_pricing():
                   type: string
                   description: Kod pocztowy celu
                   example: "DE49"
-                distance_km:
-                  type: number
-                  description: Dystans w kilometrach
-                  example: 850
-                calculated_prices:
+                start_region_id:
+                  type: integer
+                  description: ID regionu Trans.eu dla startu
+                  example: 135
+                end_region_id:
+                  type: integer
+                  description: ID regionu Trans.eu dla celu
+                  example: 98
+                pricing:
                   type: object
-                  description: Obliczone ceny dla każdego typu pojazdu (średnia z 30 dni TimoCom * dystans)
+                  description: Dane cenowe z giełd transportowych (średnie z 30 dni)
                   properties:
-                    cena_naczepa:
-                      type: number
-                      description: Cena dla naczepy (trailer)
-                      example: 1275.50
-                      nullable: true
-                    cena_bus:
-                      type: number
-                      description: Cena dla busa (do 3.5t)
-                      example: 850.75
-                      nullable: true
-                    cena_solo:
-                      type: number
-                      description: Cena dla solo (do 12t)
-                      example: 1020.25
-                      nullable: true
+                    timocom:
+                      type: object
+                      properties:
+                        30d:
+                          type: object
+                          properties:
+                            avg_price_per_km:
+                              type: object
+                              description: Średnie stawki EUR/km dla różnych typów pojazdów
+                              properties:
+                                trailer:
+                                  type: number
+                                  description: Naczepa
+                                  example: 1.50
+                                  nullable: true
+                                3_5t:
+                                  type: number
+                                  description: Bus (do 3.5t)
+                                  example: 1.00
+                                  nullable: true
+                                12t:
+                                  type: number
+                                  description: Solo (do 12t)
+                                  example: 1.20
+                                  nullable: true
+                            median_price_per_km:
+                              type: object
+                              description: Mediany cen EUR/km
+                              properties:
+                                trailer:
+                                  type: number
+                                  example: 1.55
+                                  nullable: true
+                            total_offers:
+                              type: integer
+                              description: Całkowita liczba ofert
+                              example: 24835
+                            offers_by_vehicle_type:
+                              type: object
+                              description: Liczba ofert według typu pojazdu
+                            days_with_data:
+                              type: integer
+                              description: Liczba dni z danymi
+                              example: 30
+                    transeu:
+                      type: object
+                      properties:
+                        30d:
+                          type: object
+                          properties:
+                            avg_price_per_km:
+                              type: object
+                              properties:
+                                lorry:
+                                  type: number
+                                  example: 0.87
+                                  nullable: true
+                            median_price_per_km:
+                              type: object
+                              properties:
+                                lorry:
+                                  type: number
+                                  example: 0.89
+                                  nullable: true
+                            total_offers:
+                              type: integer
+                              example: 9240
+                            days_with_data:
+                              type: integer
+                              example: 28
                 currency:
                   type: string
-                  description: Waluta cen
+                  description: Waluta
                   example: "EUR"
-        examples:
-          application/json:
-            success: true
-            data:
-              start_postal_code: "PL20"
-              end_postal_code: "DE49"
-              distance_km: 850
-              calculated_prices:
-                cena_naczepa: 1275.50
-                cena_bus: 850.75
-                cena_solo: 1020.25
-              currency: "EUR"
+                unit:
+                  type: string
+                  description: Jednostka
+                  example: "EUR/km"
+                data_sources:
+                  type: object
+                  description: Dostępność danych ze źródeł
+                  properties:
+                    timocom:
+                      type: boolean
+                      example: true
+                    transeu:
+                      type: boolean
+                      example: true
       400:
         description: Błąd zapytania - brakujące lub nieprawidłowe dane wejściowe
         schema:
@@ -647,13 +709,17 @@ def get_route_pricing():
         
         request_start = time.time()
         
-        # OPTYMALIZACJA: Pobierz tylko dane z 30 dni TimoCom (to jedyne, które używamy)
+        # OPTYMALIZACJA: Pobierz tylko dane z 30 dni z obu giełd
         timocom_start = time.time()
         timocom_30d = get_timocom_pricing(start_region_id, end_region_id, days=30)
         logger.info(f"⏱️ Zapytanie TimoCom 30d: {(time.time() - timocom_start)*1000:.0f}ms")
         
-        # Sprawdź czy są dane
-        if not timocom_30d:
+        transeu_start = time.time()
+        transeu_30d = get_transeu_pricing(start_region_id, end_region_id, days=30)
+        logger.info(f"⏱️ Zapytanie Trans.eu 30d: {(time.time() - transeu_start)*1000:.0f}ms")
+        
+        # Sprawdź czy są jakiekolwiek dane
+        if not timocom_30d and not transeu_30d:
             logger.info(f"ℹ️ No data found for route: {start_postal} -> {end_postal}")
             return jsonify({
                 'success': False,
@@ -661,43 +727,54 @@ def get_route_pricing():
                 'message': 'Nie znaleziono danych cenowych w bazie dla tej trasy'
             }), 404
 
-        # Sprawdź czy mamy kompletne dane
-        if 'avg_price_per_km' not in timocom_30d:
-            return jsonify({
-                'success': False,
-                'error': 'Brak wystarczających danych z 30 dni do obliczenia ceny'
-            }), 404
-
-        calc_start = time.time()
-        avg_rates = timocom_30d['avg_price_per_km']
-        calculated_prices = {}
-        for vehicle, rate in avg_rates.items():
-            # Zmieniamy klucze, aby pasowały do oczekiwań (bus, solo, naczepa)
-            vehicle_key = vehicle
-            if vehicle == 'trailer':
-                vehicle_key = 'naczepa'
-            elif vehicle == '3_5t':
-                vehicle_key = 'bus'
-            elif vehicle == '12t':
-                vehicle_key = 'solo'
-
-            if rate is not None:
-                calculated_prices[f'cena_{vehicle_key}'] = round(rate * float(distance), 2)
-            else:
-                calculated_prices[f'cena_{vehicle_key}'] = None
-        logger.info(f"⏱️ Obliczenia cen: {(time.time() - calc_start)*1000:.0f}ms")
+        # ZAKOMENTOWANE: Obliczanie ceny całkowitej (dystans x stawka)
+        # calc_start = time.time()
+        # avg_rates = timocom_30d['avg_price_per_km']
+        # calculated_prices = {}
+        # for vehicle, rate in avg_rates.items():
+        #     # Zmieniamy klucze, aby pasowały do oczekiwań (bus, solo, naczepa)
+        #     vehicle_key = vehicle
+        #     if vehicle == 'trailer':
+        #         vehicle_key = 'naczepa'
+        #     elif vehicle == '3_5t':
+        #         vehicle_key = 'bus'
+        #     elif vehicle == '12t':
+        #         vehicle_key = 'solo'
+        #
+        #     if rate is not None:
+        #         calculated_prices[f'cena_{vehicle_key}'] = round(rate * float(distance), 2)
+        #     else:
+        #         calculated_prices[f'cena_{vehicle_key}'] = None
+        # logger.info(f"⏱️ Obliczenia cen: {(time.time() - calc_start)*1000:.0f}ms")
+        
         logger.info(f"⏱️ ⭐ CAŁKOWITY CZAS REQUESTU: {(time.time() - request_start)*1000:.0f}ms")
-        logger.info(f"✅ Successfully returned calculated prices for {start_postal} -> {end_postal}")
+        logger.info(f"✅ Successfully returned pricing data for {start_postal} -> {end_postal}")
+
+        # Przygotuj response ze stawkami średnimi z 30 dni
+        response_data = {
+            'start_postal_code': start_postal,
+            'end_postal_code': end_postal,
+            'start_region_id': start_region_id,
+            'end_region_id': end_region_id,
+            'pricing': {
+                'timocom': {
+                    '30d': timocom_30d
+                } if timocom_30d else {},
+                'transeu': {
+                    '30d': transeu_30d
+                } if transeu_30d else {}
+            },
+            'currency': 'EUR',
+            'unit': 'EUR/km',
+            'data_sources': {
+                'timocom': bool(timocom_30d),
+                'transeu': bool(transeu_30d)
+            }
+        }
 
         return jsonify({
             'success': True,
-            'data': {
-                'start_postal_code': start_postal,
-                'end_postal_code': end_postal,
-                'distance_km': distance,
-                'calculated_prices': calculated_prices,
-                'currency': 'EUR'
-            }
+            'data': response_data
         })
         
     except Exception as e:

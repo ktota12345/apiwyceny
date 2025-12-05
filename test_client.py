@@ -1,6 +1,47 @@
 import requests
 import json
 
+"""
+Test client dla API wyceny tras transportowych
+Zwraca średnie stawki EUR/km z ostatnich 30 dni z giełd TimoCom i Trans.eu
+
+Przykładowa struktura response:
+{
+  "success": true,
+  "data": {
+    "start_postal_code": "PL20",
+    "end_postal_code": "DE49",
+    "start_region_id": 135,
+    "end_region_id": 98,
+    "pricing": {
+      "timocom": {
+        "30d": {
+          "avg_price_per_km": {
+            "trailer": 1.50,    # Naczepa
+            "3_5t": 1.00,       # Bus
+            "12t": 1.20         # Solo
+          },
+          "median_price_per_km": {...},
+          "total_offers": 24835,
+          "days_with_data": 30
+        }
+      },
+      "transeu": {
+        "30d": {
+          "avg_price_per_km": {
+            "lorry": 0.87
+          },
+          "total_offers": 9240,
+          "days_with_data": 28
+        }
+      }
+    },
+    "currency": "EUR",
+    "unit": "EUR/km"
+  }
+}
+"""
+
 url = "http://127.0.0.1:5003/api/route-pricing"
 
 payload = {

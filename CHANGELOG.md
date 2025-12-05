@@ -1,5 +1,29 @@
 # Changelog - Pricing API
 
+## [2.1.0] - 2024-12-04
+
+### 🔄 API Response Structure Change
+- **Przywrócono zwracanie średnich stawek EUR/km** zamiast obliczonych cen całkowitych
+- API zwraca teraz dane z obu giełd (TimoCom i Trans.eu) dla ostatnich 30 dni
+- Response zawiera:
+  - Średnie stawki per km dla każdego typu pojazdu
+  - Mediany cen
+  - Liczbę ofert
+  - Liczbę dni z danymi
+- **Zachowano optymalizację**: nadal tylko 2 zapytania (TimoCom 30d + Trans.eu 30d) zamiast 6
+- Zakomentowano kod obliczający cenę całkowitą (dystans × stawka) - gotowy do przywrócenia
+
+### 📚 Documentation Updates
+- Zaktualizowano Swagger z nową strukturą response
+- Dodano dokumentację do test_client.py z przykładem response
+- Zaktualizowano opis endpointa
+
+### ⚡ Performance
+- **Nadal 3x szybciej** niż w v1.0 (2 zapytania vs 6 zapytań)
+- Zachowano connection pooling i monitoring
+
+---
+
 ## [2.0.1] - 2024-12-04
 
 ### 📚 Documentation
