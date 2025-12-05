@@ -45,31 +45,52 @@ print("""
 """)
 
 # Konfiguracja Swaggera
-app.config['SWAGGER'] = {
-    'title': 'Pricing API',
-    'uiversion': 3,
-    'description': 'API do wyceny tras transportowych na podstawie historycznych danych z giełd transportowych.',
-    'termsOfService': '#',
-    'contact': {
-        'name': 'API Support',
-        'url': '#',
-        'email': 'support@example.com',
-    },
-    'license': {
-        'name': 'MIT',
-        'url': 'https://opensource.org/licenses/MIT',
-    },
-    'securityDefinitions': {
-        'ApiKeyAuth': {
-            'type': 'apiKey',
-            'in': 'header',
-            'name': 'X-API-Key',
-            'description': 'Klucz API do autoryzacji. Może być również przekazany jako `Authorization: Bearer <key>`.'
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": 'apispec_1',
+            "route": '/apispec_1.json',
+            "rule_filter": lambda rule: True,  # all in
+            "model_filter": lambda tag: True,  # all in
+        }
+    ],
+    "static_url_path": "/flasgger_static",
+    "swagger_ui": True,
+    "specs_route": "/apidocs/"
+}
+
+swagger_template = {
+    "swagger": "2.0",
+    "info": {
+        "title": "Pricing API",
+        "description": "API do wyceny tras transportowych na podstawie historycznych danych z giełd transportowych (TimoCom i Trans.eu). Zwraca średnie stawki EUR/km z ostatnich 30 dni.",
+        "contact": {
+            "name": "API Support",
+            "url": "#",
+            "email": "support@example.com"
+        },
+        "termsOfService": "#",
+        "version": "2.1.0",
+        "license": {
+            "name": "MIT",
+            "url": "https://opensource.org/licenses/MIT"
         }
     },
-    'specs_route': '/apidocs/'
+    "host": "localhost:5003",  # Zmień na właściwy host w produkcji
+    "basePath": "/",
+    "schemes": ["http", "https"],
+    "securityDefinitions": {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "name": "X-API-Key",
+            "in": "header",
+            "description": "Klucz API do autoryzacji. Można również użyć headera Authorization: Bearer <key>"
+        }
+    }
 }
-swagger = Swagger(app)
+
+swagger = Swagger(app, config=swagger_config, template=swagger_template)
 
 # CORS - tylko zaufane domeny (zmień w produkcji!)
 ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://localhost:5000').split(',')
