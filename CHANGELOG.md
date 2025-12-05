@@ -1,5 +1,36 @@
 # Changelog - Pricing API
 
+## [2.2.0] - 2024-12-05
+
+### 🔧 Critical Data Quality Fix
+- **Zmiana ze średniej arytmetycznej na średnią ważoną**
+  - Wcześniej: `AVG(cena_za_km)` - prosta średnia ze wszystkich rekordów
+  - Teraz: `SUM(cena_za_km × liczba_ofert) / SUM(liczba_ofert)` - średnia ważona
+  - **Powód:** Rekord z 10,000 ofert powinien mieć większy wpływ niż rekord z 10 ofertami
+  - Dotyczy zarówno TimoCom jak i Trans.eu
+
+### 🚨 Filtrowanie Outlierów
+- **Dodano filtrowanie błędnych danych:** wartości > 5 EUR/km są automatycznie odrzucane
+- **Przykład znalezionego błędu:** trailer: 7472 EUR/km (powinno być ~1.5 EUR/km)
+- **Debug logging:** API loguje wszystkie odrzucone outliery z:
+  - Datą rekordu
+  - Wartościami dla każdego typu pojazdu
+  - Liczbą ofert
+- Filtrowanie działa dla wszystkich typów pojazdów:
+  - TimoCom: trailer, 3.5t, 12t
+  - Trans.eu: lorry
+
+### 📊 Improved Data Accuracy
+- Użycie CTE (Common Table Expressions) dla lepszej czytelności SQL
+- NULLIF() zabezpiecza przed dzieleniem przez zero
+- Filtrowane dane trafiają również do obliczania median
+
+### 🐛 Bug Fixed
+- Naprawiono zawyżone średnie spowodowane outlierami w bazie danych
+- Średnie są teraz reprezentatywne dla rzeczywistego rynku transportowego
+
+---
+
 ## [2.1.0] - 2024-12-04
 
 ### 🔄 API Response Structure Change
