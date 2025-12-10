@@ -293,130 +293,107 @@ def get_timocom_pricing(start_region_id: int, end_region_id: int, days: int = 7)
         with conn.cursor() as cur:
             # Próg dla outlierów - wartości powyżej 5 EUR/km są podejrzane
             OUTLIER_THRESHOLD = 5.0
-            
-            # DEBUGOWANIE: Sprawdź czy są outliery przed filtrowaniem
-            debug_query = """
+
+            # Zoptymalizowane zapytanie - 1 zamiast 2
+            query = """
+                WITH all_offers AS (
+                    SELECT
+                        *,
+                        (trailer_avg_price_per_km > %(threshold)s OR
+                         vehicle_up_to_3_5_t_avg_price_per_km > %(threshold)s OR
+                         vehicle_up_to_12_t_avg_price_per_km > %(threshold)s) AS is_outlier
+                    FROM public.offers
+                    WHERE
+                        starting_id = %(start_id)s
+                        AND destination_id = %(end_id)s
+                        AND enlistment_date >= CURRENT_DATE - CAST(%(days)s AS INTEGER)
+                ),
+                outliers AS (
+                    SELECT
+                        enlistment_date,
+                        trailer_avg_price_per_km,
+                        vehicle_up_to_3_5_t_avg_price_per_km,
+                        vehicle_up_to_12_t_avg_price_per_km
+                    FROM all_offers
+                    WHERE is_outlier = TRUE
+                    ORDER BY
+                        GREATEST(
+                            COALESCE(trailer_avg_price_per_km, 0),
+                            COALESCE(vehicle_up_to_3_5_t_avg_price_per_km, 0),
+                            COALESCE(vehicle_up_to_12_t_avg_price_per_km, 0)
+                        ) DESC
+                    LIMIT 5
+                ),
+                clean_offers AS (
+                    SELECT * FROM all_offers WHERE is_outlier = FALSE
+                ),
+                aggregated_data AS (
+                    SELECT
+                        -- Średnie ważone
+                        SUM(trailer_avg_price_per_km * number_of_offers_trailer) / NULLIF(SUM(number_of_offers_trailer), 0) AS avg_trailer_price,
+                        SUM(vehicle_up_to_3_5_t_avg_price_per_km * number_of_offers_vehicle_up_to_3_5_t) / NULLIF(SUM(number_of_offers_vehicle_up_to_3_5_t), 0) AS avg_3_5t_price,
+                        SUM(vehicle_up_to_12_t_avg_price_per_km * number_of_offers_vehicle_up_to_12_t) / NULLIF(SUM(number_of_offers_vehicle_up_to_12_t), 0) AS avg_12t_price,
+                        
+                        -- Mediany i sumy
+                        AVG(trailer_median_price_per_km) AS median_trailer_price,
+                        SUM(number_of_offers_total) AS total_offers,
+                        SUM(number_of_offers_trailer) AS total_offers_trailer,
+                        SUM(number_of_offers_vehicle_up_to_3_5_t) AS total_offers_3_5t,
+                        SUM(number_of_offers_vehicle_up_to_12_t) AS total_offers_12t,
+                        COUNT(DISTINCT enlistment_date) AS days_count
+                    FROM clean_offers
+                )
                 SELECT
-                    enlistment_date,
-                    trailer_avg_price_per_km,
-                    vehicle_up_to_3_5_t_avg_price_per_km,
-                    vehicle_up_to_12_t_avg_price_per_km,
-                    number_of_offers_trailer,
-                    number_of_offers_vehicle_up_to_3_5_t,
-                    number_of_offers_vehicle_up_to_12_t
-                FROM public.offers
-                WHERE
-                    starting_id = %s
-                    AND destination_id = %s
-                    AND enlistment_date >= CURRENT_DATE - CAST(%s AS INTEGER)
-                    AND (
-                        trailer_avg_price_per_km > %s OR
-                        vehicle_up_to_3_5_t_avg_price_per_km > %s OR
-                        vehicle_up_to_12_t_avg_price_per_km > %s
-                    )
-                ORDER BY 
-                    GREATEST(
-                        COALESCE(trailer_avg_price_per_km, 0),
-                        COALESCE(vehicle_up_to_3_5_t_avg_price_per_km, 0),
-                        COALESCE(vehicle_up_to_12_t_avg_price_per_km, 0)
-                    ) DESC
-                LIMIT 5;
+                    (SELECT json_agg(t) FROM aggregated_data t) AS aggregated,
+                    (SELECT json_agg(o) FROM outliers o) AS outliers;
             """
             
-            cur.execute(debug_query, (
-                timocom_start_id, timocom_end_id, days,
-                OUTLIER_THRESHOLD, OUTLIER_THRESHOLD, OUTLIER_THRESHOLD
-            ))
-            outliers = cur.fetchall()
-            
-            if outliers:
+            query_start = time.time()
+            cur.execute(query, {
+                'start_id': timocom_start_id,
+                'end_id': timocom_end_id,
+                'days': days,
+                'threshold': OUTLIER_THRESHOLD
+            })
+            result = cur.fetchone()
+            logger.info(f"⏱️ Zapytanie SQL ({days}d): {(time.time() - query_start)*1000:.0f}ms")
+
+            # Logowanie outlierów
+            if result and result['outliers']:
+                outliers = result['outliers']
                 logger.warning(f"🚨 TimoCom: Znaleziono {len(outliers)} outlierów (>{OUTLIER_THRESHOLD} EUR/km) dla trasy {timocom_start_id}->{timocom_end_id}:")
                 for idx, outlier in enumerate(outliers, 1):
                     logger.warning(f"   #{idx} Data: {outlier['enlistment_date']}, "
                                  f"Trailer: {outlier['trailer_avg_price_per_km']}, "
                                  f"3.5t: {outlier['vehicle_up_to_3_5_t_avg_price_per_km']}, "
                                  f"12t: {outlier['vehicle_up_to_12_t_avg_price_per_km']}")
-            
-            query = """
-                WITH filtered_offers AS (
-                    SELECT *
-                    FROM public.offers
-                    WHERE
-                        starting_id = %s
-                        AND destination_id = %s
-                        AND enlistment_date >= CURRENT_DATE - CAST(%s AS INTEGER)
-                        -- Filtrowanie outlierów dla każdego typu pojazdu
-                        AND (trailer_avg_price_per_km IS NULL OR trailer_avg_price_per_km <= %s)
-                        AND (vehicle_up_to_3_5_t_avg_price_per_km IS NULL OR vehicle_up_to_3_5_t_avg_price_per_km <= %s)
-                        AND (vehicle_up_to_12_t_avg_price_per_km IS NULL OR vehicle_up_to_12_t_avg_price_per_km <= %s)
-                )
-                SELECT
-                    -- ŚREDNIA WAŻONA dla naczepy: SUM(cena * liczba_ofert) / SUM(liczba_ofert)
-                    ROUND(
-                        SUM(trailer_avg_price_per_km * number_of_offers_trailer) / 
-                        NULLIF(SUM(number_of_offers_trailer), 0),
-                        4
-                    ) AS avg_trailer_price,
-                    
-                    -- ŚREDNIA WAŻONA dla busa (3.5t)
-                    ROUND(
-                        SUM(vehicle_up_to_3_5_t_avg_price_per_km * number_of_offers_vehicle_up_to_3_5_t) / 
-                        NULLIF(SUM(number_of_offers_vehicle_up_to_3_5_t), 0),
-                        4
-                    ) AS avg_3_5t_price,
 
-                    -- ŚREDNIA WAŻONA dla solo (12t)
-                    ROUND(
-                        SUM(vehicle_up_to_12_t_avg_price_per_km * number_of_offers_vehicle_up_to_12_t) / 
-                        NULLIF(SUM(number_of_offers_vehicle_up_to_12_t), 0),
-                        4
-                    ) AS avg_12t_price,
-
-                    -- Mediana (pozostaje jako AVG z odfiltrowanych danych)
-                    ROUND(AVG(trailer_median_price_per_km), 4) AS median_trailer_price,
-                    
-                    -- Sumy ofert i liczba dni
-                    SUM(number_of_offers_total) AS total_offers,
-                    SUM(number_of_offers_trailer) AS total_offers_trailer,
-                    SUM(number_of_offers_vehicle_up_to_3_5_t) AS total_offers_3_5t,
-                    SUM(number_of_offers_vehicle_up_to_12_t) AS total_offers_12t,
-                    COUNT(DISTINCT enlistment_date) AS days_count
-                FROM filtered_offers;
-            """
-            
-            query_start = time.time()
-            cur.execute(query, (
-                timocom_start_id, 
-                timocom_end_id, 
-                days,
-                OUTLIER_THRESHOLD,
-                OUTLIER_THRESHOLD,
-                OUTLIER_THRESHOLD
-            ))
-            result = cur.fetchone()
-            logger.info(f"⏱️ Zapytanie SQL ({days}d): {(time.time() - query_start)*1000:.0f}ms")
-            
-            if not result or (not result['avg_trailer_price'] and not result['avg_3_5t_price'] and not result['avg_12t_price']):
+            # Przetwarzanie zagregowanych danych
+            if not result or not result['aggregated']:
                 return None
-            
+
+            agg_data = result['aggregated'][0]
+            if not agg_data or (not agg_data.get('avg_trailer_price') and not agg_data.get('avg_3_5t_price') and not agg_data.get('avg_12t_price')):
+                return None
+
             return {
                 'avg_price_per_km': {
-                    'trailer': float(result['avg_trailer_price']) if result['avg_trailer_price'] else None,
-                    '3_5t': float(result['avg_3_5t_price']) if result['avg_3_5t_price'] else None,
-                    '12t': float(result['avg_12t_price']) if result['avg_12t_price'] else None
+                    'trailer': float(agg_data['avg_trailer_price']) if agg_data.get('avg_trailer_price') else None,
+                    '3_5t': float(agg_data['avg_3_5t_price']) if agg_data.get('avg_3_5t_price') else None,
+                    '12t': float(agg_data['avg_12t_price']) if agg_data.get('avg_12t_price') else None
                 },
                 'median_price_per_km': {
-                    'trailer': float(result['median_trailer_price']) if result['median_trailer_price'] else None,
+                    'trailer': float(agg_data['median_trailer_price']) if agg_data.get('median_trailer_price') else None,
                     '3_5t': None,
                     '12t': None
                 },
-                'total_offers': int(result['total_offers']) if result['total_offers'] else 0,
+                'total_offers': int(agg_data['total_offers']) if agg_data.get('total_offers') else 0,
                 'offers_by_vehicle_type': {
-                    'trailer': int(result['total_offers_trailer']) if result['total_offers_trailer'] else 0,
-                    '3_5t': int(result['total_offers_3_5t']) if result['total_offers_3_5t'] else 0,
-                    '12t': int(result['total_offers_12t']) if result['total_offers_12t'] else 0
+                    'trailer': int(agg_data['total_offers_trailer']) if agg_data.get('total_offers_trailer') else 0,
+                    '3_5t': int(agg_data['total_offers_3_5t']) if agg_data.get('total_offers_3_5t') else 0,
+                    '12t': int(agg_data['total_offers_12t']) if agg_data.get('total_offers_12t') else 0
                 },
-                'days_with_data': int(result['days_count']) if result['days_count'] else 0
+                'days_with_data': int(agg_data['days_count']) if agg_data.get('days_count') else 0
             }
             
     except Exception as exc:
@@ -435,77 +412,77 @@ def get_transeu_pricing(start_region_id: int, end_region_id: int, days: int = 7)
         conn = _get_db_connection()
         
         with conn.cursor() as cur:
-            # Próg dla outlierów - wartości powyżej 5 EUR/km są podejrzane
             OUTLIER_THRESHOLD = 5.0
-            
-            # DEBUGOWANIE: Sprawdź czy są outliery przed filtrowaniem
-            debug_query = """
+
+            query = '''
+                WITH all_offers AS (
+                    SELECT
+                        *,
+                        (lorry_avg_price_per_km > %(threshold)s) AS is_outlier
+                    FROM public."OffersTransEU"
+                    WHERE
+                        starting_id = %(start_id)s
+                        AND destination_id = %(end_id)s
+                        AND enlistment_date >= CURRENT_DATE - CAST(%(days)s AS INTEGER)
+                ),
+                outliers AS (
+                    SELECT
+                        enlistment_date,
+                        lorry_avg_price_per_km,
+                        number_of_offers
+                    FROM all_offers
+                    WHERE is_outlier = TRUE
+                    ORDER BY lorry_avg_price_per_km DESC
+                    LIMIT 5
+                ),
+                clean_offers AS (
+                    SELECT * FROM all_offers WHERE is_outlier = FALSE
+                ),
+                aggregated_data AS (
+                    SELECT
+                        SUM(lorry_avg_price_per_km * number_of_offers) / NULLIF(SUM(number_of_offers), 0) AS avg_lorry_price,
+                        AVG(lorry_median_price_per_km) AS median_lorry_price,
+                        SUM(number_of_offers) AS total_offers,
+                        COUNT(DISTINCT enlistment_date) AS days_count
+                    FROM clean_offers
+                )
                 SELECT
-                    enlistment_date,
-                    lorry_avg_price_per_km,
-                    number_of_offers
-                FROM public."OffersTransEU"
-                WHERE
-                    starting_id = %s
-                    AND destination_id = %s
-                    AND enlistment_date >= CURRENT_DATE - CAST(%s AS INTEGER)
-                    AND lorry_avg_price_per_km > %s
-                ORDER BY lorry_avg_price_per_km DESC
-                LIMIT 5;
-            """
-            
-            cur.execute(debug_query, (start_region_id, end_region_id, days, OUTLIER_THRESHOLD))
-            outliers = cur.fetchall()
-            
-            if outliers:
+                    (SELECT json_agg(t) FROM aggregated_data t) AS aggregated,
+                    (SELECT json_agg(o) FROM outliers o) AS outliers;
+            '''
+
+            cur.execute(query, {
+                'start_id': start_region_id,
+                'end_id': end_region_id,
+                'days': days,
+                'threshold': OUTLIER_THRESHOLD
+            })
+            result = cur.fetchone()
+
+            if result and result['outliers']:
+                outliers = result['outliers']
                 logger.warning(f"🚨 Trans.eu: Znaleziono {len(outliers)} outlierów (>{OUTLIER_THRESHOLD} EUR/km) dla trasy {start_region_id}->{end_region_id}:")
                 for idx, outlier in enumerate(outliers, 1):
                     logger.warning(f"   #{idx} Data: {outlier['enlistment_date']}, "
                                  f"Lorry: {outlier['lorry_avg_price_per_km']}, "
                                  f"Oferty: {outlier['number_of_offers']}")
-            
-            query = """
-                WITH filtered_offers AS (
-                    SELECT *
-                    FROM public."OffersTransEU"
-                    WHERE
-                        starting_id = %s
-                        AND destination_id = %s
-                        AND enlistment_date >= CURRENT_DATE - CAST(%s AS INTEGER)
-                        -- Filtrowanie outlierów
-                        AND (lorry_avg_price_per_km IS NULL OR lorry_avg_price_per_km <= %s)
-                )
-                SELECT
-                    -- ŚREDNIA WAŻONA dla lorry: SUM(cena * liczba_ofert) / SUM(liczba_ofert)
-                    ROUND(
-                        SUM(lorry_avg_price_per_km * number_of_offers) / 
-                        NULLIF(SUM(number_of_offers), 0),
-                        4
-                    ) AS avg_lorry_price,
-                    
-                    -- Mediana (AVG z odfiltrowanych danych)
-                    ROUND(AVG(lorry_median_price_per_km), 4) AS median_lorry_price,
-                    
-                    SUM(number_of_offers) AS total_offers,
-                    COUNT(DISTINCT enlistment_date) AS days_count
-                FROM filtered_offers;
-            """
-            
-            cur.execute(query, (start_region_id, end_region_id, days, OUTLIER_THRESHOLD))
-            result = cur.fetchone()
-            
-            if not result or not result['avg_lorry_price']:
+
+            if not result or not result['aggregated']:
                 return None
-            
+
+            agg_data = result['aggregated'][0]
+            if not agg_data or not agg_data.get('avg_lorry_price'):
+                return None
+
             return {
                 'avg_price_per_km': {
-                    'lorry': float(result['avg_lorry_price']) if result['avg_lorry_price'] else None
+                    'lorry': float(agg_data['avg_lorry_price']) if agg_data.get('avg_lorry_price') else None
                 },
                 'median_price_per_km': {
-                    'lorry': float(result['median_lorry_price']) if result['median_lorry_price'] else None
+                    'lorry': float(agg_data['median_lorry_price']) if agg_data.get('median_lorry_price') else None
                 },
-                'total_offers': int(result['total_offers']) if result['total_offers'] else 0,
-                'days_with_data': int(result['days_count']) if result['days_count'] else 0
+                'total_offers': int(agg_data['total_offers']) if agg_data.get('total_offers') else 0,
+                'days_with_data': int(agg_data['days_count']) if agg_data.get('days_count') else 0
             }
             
     except Exception as exc:
