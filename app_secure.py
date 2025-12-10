@@ -32,14 +32,15 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# STARTUP LOG - WERSJA Z OPTYMALIZACJĄ (1 zapytanie zamiast 6)
+# STARTUP LOG - WERSJA Z OPTYMALIZACJĄ
 print("""
 **********************************************
 *                                            *
-*   SECURED & OPTIMIZED PRICING API v2.0    *
+*   SECURED & OPTIMIZED PRICING API v2.3    *
 *   - Single query optimization             *
 *   - Connection pooling with validation    *
 *   - Performance monitoring                *
+*   - Historical orders integration         *
 *                                            *
 **********************************************
 """)
@@ -64,14 +65,14 @@ swagger_template = {
     "swagger": "2.0",
     "info": {
         "title": "Pricing API",
-        "description": "API do wyceny tras transportowych na podstawie historycznych danych z giełd transportowych (TimoCom i Trans.eu). Zwraca średnie stawki EUR/km z ostatnich 30 dni.",
+        "description": "API do wyceny tras transportowych. Zwraca średnie stawki EUR/km z giełd transportowych (TimoCom i Trans.eu - ostatnie 30 dni) oraz z historycznych zleceń firmowych (ostatnie 6 miesięcy z top 4 przewoźnikami).",
         "contact": {
             "name": "API Support",
             "url": "#",
             "email": "support@example.com"
         },
         "termsOfService": "#",
-        "version": "2.1.0",
+        "version": "2.3.0",
         "license": {
             "name": "MIT",
             "url": "https://opensource.org/licenses/MIT"
@@ -116,11 +117,12 @@ DB_HOST = os.getenv("POSTGRES_HOST")
 DB_PORT = os.getenv("POSTGRES_PORT")
 DB_USER = os.getenv("POSTGRES_USER")
 DB_NAME = os.getenv("POSTGRES_DB")
+DB_NAME_MAIN = os.getenv("POSTGRES_DB_MAIN")  # Baza ze zleceniami historycznymi
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 API_KEY = os.getenv('API_KEY', '')
 ENV = os.getenv('ENV', 'development')
 
-# Connection Pool - zamiast tworzyć nowe połączenie za każdym razem
+# Connection Pool - baza z danymi giełd (TimoCom, Trans.eu)
 try:
     connection_pool = pool.SimpleConnectionPool(
         minconn=1,
@@ -134,10 +136,29 @@ try:
         connect_timeout=10,
         options='-c statement_timeout=30000'  # 30 sekund timeout dla zapytań
     )
-    logger.info("✅ Connection pool initialized")
+    logger.info("✅ Connection pool (exchanges) initialized")
 except Exception as e:
-    logger.error(f"❌ Failed to create connection pool: {e}")
+    logger.error(f"❌ Failed to create connection pool (exchanges): {e}")
     connection_pool = None
+
+# Connection Pool - baza ze zleceniami historycznymi
+try:
+    connection_pool_main = pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=10,
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME_MAIN,
+        cursor_factory=RealDictCursor,
+        connect_timeout=10,
+        options='-c statement_timeout=30000'
+    )
+    logger.info("✅ Connection pool (historical orders) initialized")
+except Exception as e:
+    logger.error(f"❌ Failed to create connection pool (historical orders): {e}")
+    connection_pool_main = None
 
 # Cache
 _TRANSEU_TO_TIMOCOM_MAPPING = None
@@ -249,6 +270,40 @@ def _return_db_connection(conn):
     """Zwraca połączenie do pool"""
     if connection_pool and conn:
         connection_pool.putconn(conn)
+
+
+def _get_db_connection_main():
+    """Pobiera połączenie z pool_main (baza ze zleceniami historycznymi) i weryfikuje, czy jest aktywne"""
+    if connection_pool_main is None:
+        raise Exception("Connection pool (main) not initialized")
+    
+    try:
+        conn = connection_pool_main.getconn()
+        
+        # Sprawdź czy połączenie jest aktywne
+        try:
+            with conn.cursor() as test_cursor:
+                test_cursor.execute('SELECT 1')
+        except Exception as e:
+            logger.warning(f"⚠️ Stale connection (main) detected, reconnecting: {e}")
+            # Jeśli połączenie martwe, zamknij i pobierz nowe
+            try:
+                conn.close()
+            except:
+                pass
+            connection_pool_main.putconn(conn, close=True)
+            conn = connection_pool_main.getconn()
+        
+        return conn
+    except Exception as e:
+        logger.error(f"❌ Failed to get connection from pool (main): {e}")
+        raise
+
+
+def _return_db_connection_main(conn):
+    """Zwraca połączenie do pool_main"""
+    if connection_pool_main and conn:
+        connection_pool_main.putconn(conn)
 
 
 def _load_transeu_timocom_mapping():
@@ -493,6 +548,218 @@ def get_transeu_pricing(start_region_id: int, end_region_id: int, days: int = 7)
             _return_db_connection(conn)
 
 
+def get_historical_orders_pricing(start_region_code: str, end_region_code: str, days: int = 180):
+    """
+    Pobiera statystyki z tabeli zleceń historycznych (ZleceniaSpeed)
+    
+    Args:
+        start_region_code: Kod regionu startu (np. "PL20")
+        end_region_code: Kod regionu celu (np. "DE49")
+        days: Liczba dni wstecz (domyślnie 180 - ostatnie pół roku)
+    
+    Returns:
+        Słownik ze statystykami (w tym top 4 przewoźników) lub None jeśli brak danych
+    """
+    start_time = time.time()
+    conn = None
+    try:
+        conn_start = time.time()
+        conn = _get_db_connection_main()
+        logger.info(f"⏱️ Połączenie z bazą (historical): {(time.time() - conn_start)*1000:.0f}ms")
+        
+        with conn.cursor() as cur:
+            # Próg dla outlierów - analogiczny do giełd
+            OUTLIER_THRESHOLD = 5.0
+            
+            # Zoptymalizowane zapytanie z podziałem na FTL i LTL oraz top 4 przewoźnikami
+            query = """
+                WITH all_orders AS (
+                    SELECT
+                        "orderDate",
+                        "carrierId",
+                        "carrierName",
+                        "cargoType",
+                        "clientPricePerKm",
+                        "carrierPricePerKm",
+                        "clientAmount",
+                        "carrierAmount",
+                        "routeDistance",
+                        "clientCurrency",
+                        "carrierCurrency",
+                        "status",
+                        -- Outlier: cena za km > 5 EUR
+                        ("clientPricePerKm" > %(threshold)s OR "carrierPricePerKm" > %(threshold)s) AS is_outlier
+                    FROM "ZleceniaSpeed"
+                    WHERE
+                        "loadingRegionCode" = %(start_code)s
+                        AND "unloadingRegionCode" = %(end_code)s
+                        AND "orderDate" >= CURRENT_DATE - CAST(%(days)s AS INTEGER)
+                        AND "status" = 'Z'  -- Tylko zlecenia zakończone
+                        AND "clientPricePerKm" IS NOT NULL
+                        AND "clientPricePerKm" > 0
+                        AND "cargoType" IN ('FTL', 'LTL')  -- Tylko FTL i LTL
+                        AND "clientId" != 1  -- Pomijamy klienta Motiva (id = 1)
+                        AND "routeDistance" > 499  -- Tylko trasy powyżej 499 km
+                ),
+                outliers AS (
+                    SELECT
+                        "orderDate",
+                        "cargoType",
+                        "clientPricePerKm",
+                        "carrierPricePerKm",
+                        "clientAmount",
+                        "carrierAmount"
+                    FROM all_orders
+                    WHERE is_outlier = TRUE
+                    ORDER BY "clientPricePerKm" DESC
+                    LIMIT 5
+                ),
+                clean_orders AS (
+                    SELECT * FROM all_orders WHERE is_outlier = FALSE
+                ),
+                aggregated_data AS (
+                    SELECT
+                        "cargoType",
+                        -- Średnie ceny za km
+                        AVG("clientPricePerKm") AS avg_client_price_per_km,
+                        AVG("carrierPricePerKm") AS avg_carrier_price_per_km,
+                        
+                        -- Mediany
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "clientPricePerKm") AS median_client_price_per_km,
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "carrierPricePerKm") AS median_carrier_price_per_km,
+                        
+                        -- Średnie kwoty całkowite
+                        AVG("clientAmount") AS avg_client_amount,
+                        AVG("carrierAmount") AS avg_carrier_amount,
+                        
+                        -- Średni dystans
+                        AVG("routeDistance") AS avg_distance,
+                        
+                        -- Liczba zleceń
+                        COUNT(*) AS total_orders,
+                        COUNT(DISTINCT DATE("orderDate")) AS days_count
+                    FROM clean_orders
+                    GROUP BY "cargoType"
+                ),
+                top_carriers AS (
+                    SELECT
+                        "cargoType",
+                        "carrierId",
+                        "carrierName",
+                        COUNT(*) AS order_count,
+                        AVG("clientPricePerKm") AS avg_client_price_per_km,
+                        AVG("carrierPricePerKm") AS avg_carrier_price_per_km,
+                        AVG("clientAmount") AS avg_client_amount,
+                        AVG("carrierAmount") AS avg_carrier_amount,
+                        ROW_NUMBER() OVER (PARTITION BY "cargoType" ORDER BY COUNT(*) DESC) AS rn
+                    FROM clean_orders
+                    WHERE "carrierId" IS NOT NULL 
+                        AND "carrierName" IS NOT NULL
+                    GROUP BY "cargoType", "carrierId", "carrierName"
+                )
+                SELECT
+                    (SELECT json_agg(t) FROM aggregated_data t) AS aggregated,
+                    (SELECT json_agg(o) FROM outliers o) AS outliers,
+                    (SELECT json_agg(c) FROM top_carriers c WHERE c.rn <= 4) AS top_carriers;
+            """
+            
+            query_start = time.time()
+            cur.execute(query, {
+                'start_code': start_region_code,
+                'end_code': end_region_code,
+                'days': days,
+                'threshold': OUTLIER_THRESHOLD
+            })
+            result = cur.fetchone()
+            logger.info(f"⏱️ Zapytanie SQL (historical {days}d): {(time.time() - query_start)*1000:.0f}ms")
+            
+            # Logowanie outlierów
+            if result and result['outliers']:
+                outliers = result['outliers']
+                logger.warning(f"🚨 Historical: Znaleziono {len(outliers)} outlierów (>{OUTLIER_THRESHOLD} EUR/km) dla trasy {start_region_code}->{end_region_code}:")
+                for idx, outlier in enumerate(outliers, 1):
+                    logger.warning(f"   #{idx} Data: {outlier['orderDate']}, "
+                                 f"Client: {outlier['clientPricePerKm']} EUR/km, "
+                                 f"Carrier: {outlier['carrierPricePerKm']} EUR/km")
+            
+            # Przetwarzanie zagregowanych danych
+            if not result or not result['aggregated']:
+                return None
+            
+            # Sprawdź czy są jakiekolwiek dane
+            if not result['aggregated'] or len(result['aggregated']) == 0:
+                return None
+            
+            # Inicjalizacja struktur dla FTL i LTL
+            ftl_data = None
+            ltl_data = None
+            
+            # Przetwarzanie danych zagregowanych według cargoType
+            for agg_data in result['aggregated']:
+                cargo_type = agg_data.get('cargoType')
+                
+                stats = {
+                    'avg_price_per_km': {
+                        'client': float(agg_data['avg_client_price_per_km']) if agg_data.get('avg_client_price_per_km') else None,
+                        'carrier': float(agg_data['avg_carrier_price_per_km']) if agg_data.get('avg_carrier_price_per_km') else None
+                    },
+                    'median_price_per_km': {
+                        'client': float(agg_data['median_client_price_per_km']) if agg_data.get('median_client_price_per_km') else None,
+                        'carrier': float(agg_data['median_carrier_price_per_km']) if agg_data.get('median_carrier_price_per_km') else None
+                    },
+                    'avg_amounts': {
+                        'client': float(agg_data['avg_client_amount']) if agg_data.get('avg_client_amount') else None,
+                        'carrier': float(agg_data['avg_carrier_amount']) if agg_data.get('avg_carrier_amount') else None
+                    },
+                    'avg_distance': float(agg_data['avg_distance']) if agg_data.get('avg_distance') else None,
+                    'total_orders': int(agg_data['total_orders']) if agg_data.get('total_orders') else 0,
+                    'days_with_data': int(agg_data['days_count']) if agg_data.get('days_count') else 0,
+                    'top_carriers': []
+                }
+                
+                if cargo_type == 'FTL':
+                    ftl_data = stats
+                elif cargo_type == 'LTL':
+                    ltl_data = stats
+            
+            # Przetwarzanie top przewoźników według cargoType
+            if result.get('top_carriers'):
+                for carrier in result['top_carriers']:
+                    cargo_type = carrier.get('cargoType')
+                    carrier_info = {
+                        'carrier_id': int(carrier['carrierId']) if carrier.get('carrierId') else None,
+                        'carrier_name': carrier.get('carrierName'),
+                        'order_count': int(carrier['order_count']) if carrier.get('order_count') else 0,
+                        'avg_client_price_per_km': float(carrier['avg_client_price_per_km']) if carrier.get('avg_client_price_per_km') else None,
+                        'avg_carrier_price_per_km': float(carrier['avg_carrier_price_per_km']) if carrier.get('avg_carrier_price_per_km') else None,
+                        'avg_client_amount': float(carrier['avg_client_amount']) if carrier.get('avg_client_amount') else None,
+                        'avg_carrier_amount': float(carrier['avg_carrier_amount']) if carrier.get('avg_carrier_amount') else None
+                    }
+                    
+                    if cargo_type == 'FTL' and ftl_data:
+                        ftl_data['top_carriers'].append(carrier_info)
+                    elif cargo_type == 'LTL' and ltl_data:
+                        ltl_data['top_carriers'].append(carrier_info)
+            
+            # Zwróć dane tylko jeśli jest FTL lub LTL
+            if not ftl_data and not ltl_data:
+                return None
+            
+            result_data = {}
+            if ftl_data:
+                result_data['FTL'] = ftl_data
+            if ltl_data:
+                result_data['LTL'] = ltl_data
+            
+            return result_data
+            
+    except Exception as exc:
+        logger.error(f"❌ Historical orders query error: {exc}", exc_info=True)
+        return None
+    finally:
+        if conn:
+            _return_db_connection_main(conn)
+        logger.info(f"⏱️ CAŁKOWITY CZAS get_historical_orders_pricing ({days}d): {(time.time() - start_time)*1000:.0f}ms")
 
 
 def _load_postal_code_mapping():
@@ -530,12 +797,13 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'service': 'Pricing API (Secured & Optimized)',
-        'version': '2.2.0',
+        'version': '2.3.0',
         'features': {
             'security': 'API Key + Rate Limiting + HTTPS',
-            'optimization': '2 queries only (TimoCom + Trans.eu 30d)',
+            'optimization': 'Single optimized query per data source',
             'monitoring': 'Performance metrics enabled',
-            'data': 'Weighted avg rates EUR/km from both exchanges',
+            'data_sources': 'TimoCom + Trans.eu exchanges + Historical orders',
+            'data': 'Weighted avg rates EUR/km from exchanges and real orders',
             'data_quality': 'Outlier filtering (>5 EUR/km removed)'
         }
     })
@@ -546,8 +814,10 @@ def health_check():
 @limiter.limit("5 per minute")  # Max 5 requestów na minutę
 def get_route_pricing():
     """Pobierz dane cenowe dla trasy transportowej
-    Endpoint do pobierania średnich stawek transportowych z giełd TimoCom i Trans.eu.
-    Zwraca średnie stawki EUR/km z ostatnich 30 dni dla różnych typów pojazdów.
+    Endpoint zwraca średnie stawki transportowe EUR/km z trzech źródeł:
+    - TimoCom: ostatnie 30 dni (różne typy pojazdów)
+    - Trans.eu: ostatnie 30 dni
+    - Zlecenia historyczne firmowe: ostatnie 6 miesięcy (180 dni) z top 4 przewoźnikami
     ---
     tags:
       - Pricing
@@ -586,7 +856,7 @@ def get_route_pricing():
               minimum: 1
     responses:
       200:
-        description: Sukces - średnie stawki z 30 dni dla wszystkich typów pojazdów z obu giełd
+        description: Sukces - średnie stawki z giełd (30 dni) i zleceń historycznych (180 dni z top przewoźnikami)
         schema:
           id: PricingResponse
           type: object
@@ -615,7 +885,7 @@ def get_route_pricing():
                   example: 98
                 pricing:
                   type: object
-                  description: Dane cenowe z giełd transportowych (średnie z 30 dni)
+                  description: Dane cenowe z giełd (30 dni) i zleceń historycznych firmowych (180 dni)
                   properties:
                     timocom:
                       type: object
@@ -687,6 +957,173 @@ def get_route_pricing():
                             days_with_data:
                               type: integer
                               example: 28
+                    historical:
+                      type: object
+                      description: Statystyki z rzeczywistych zleceń historycznych (ostatnie 6 miesięcy) z podziałem na FTL i LTL
+                      properties:
+                        180d:
+                          type: object
+                          description: Dane podzielone według typu ładunku
+                          properties:
+                            FTL:
+                              type: object
+                              description: Pełne ładunki (Full Truck Load)
+                              properties:
+                                avg_price_per_km:
+                                  type: object
+                                  description: Średnie ceny za km
+                                  properties:
+                                    client:
+                                      type: number
+                                      description: Cena sprzedaży
+                                      example: 0.95
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      description: Koszt realizacji
+                                      example: 0.85
+                                      nullable: true
+                                median_price_per_km:
+                                  type: object
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 0.92
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 0.83
+                                      nullable: true
+                                avg_amounts:
+                                  type: object
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 850.50
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 750.00
+                                      nullable: true
+                                avg_distance:
+                                  type: number
+                                  example: 900.5
+                                  nullable: true
+                                total_orders:
+                                  type: integer
+                                  example: 25
+                                days_with_data:
+                                  type: integer
+                                  example: 28
+                                top_carriers:
+                                  type: array
+                                  description: Top 4 przewoźników FTL
+                                  items:
+                                    type: object
+                                    properties:
+                                      carrier_id:
+                                        type: integer
+                                        example: 123
+                                      carrier_name:
+                                        type: string
+                                        example: "TRANS-POL SP. Z O.O."
+                                      order_count:
+                                        type: integer
+                                        example: 15
+                                      avg_client_price_per_km:
+                                        type: number
+                                        example: 0.98
+                                        nullable: true
+                                      avg_carrier_price_per_km:
+                                        type: number
+                                        example: 0.88
+                                        nullable: true
+                                      avg_client_amount:
+                                        type: number
+                                        example: 880.00
+                                        nullable: true
+                                      avg_carrier_amount:
+                                        type: number
+                                        example: 790.00
+                                        nullable: true
+                            LTL:
+                              type: object
+                              description: Ładunki częściowe (Less Than Truckload)
+                              properties:
+                                avg_price_per_km:
+                                  type: object
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 1.15
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 1.05
+                                      nullable: true
+                                median_price_per_km:
+                                  type: object
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 1.12
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 1.03
+                                      nullable: true
+                                avg_amounts:
+                                  type: object
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 450.00
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 380.00
+                                      nullable: true
+                                avg_distance:
+                                  type: number
+                                  example: 400.0
+                                  nullable: true
+                                total_orders:
+                                  type: integer
+                                  example: 20
+                                days_with_data:
+                                  type: integer
+                                  example: 25
+                                top_carriers:
+                                  type: array
+                                  description: Top 4 przewoźników LTL
+                                  items:
+                                    type: object
+                                    properties:
+                                      carrier_id:
+                                        type: integer
+                                        example: 456
+                                      carrier_name:
+                                        type: string
+                                        example: "EXPRESS-TRANS"
+                                      order_count:
+                                        type: integer
+                                        example: 10
+                                      avg_client_price_per_km:
+                                        type: number
+                                        example: 1.18
+                                        nullable: true
+                                      avg_carrier_price_per_km:
+                                        type: number
+                                        example: 1.08
+                                        nullable: true
+                                      avg_client_amount:
+                                        type: number
+                                        example: 480.00
+                                        nullable: true
+                                      avg_carrier_amount:
+                                        type: number
+                                        example: 410.00
+                                        nullable: true
                 currency:
                   type: string
                   description: Waluta
@@ -703,6 +1140,9 @@ def get_route_pricing():
                       type: boolean
                       example: true
                     transeu:
+                      type: boolean
+                      example: true
+                    historical:
                       type: boolean
                       example: true
       400:
@@ -841,8 +1281,13 @@ def get_route_pricing():
         transeu_30d = get_transeu_pricing(start_region_id, end_region_id, days=30)
         logger.info(f"⏱️ Zapytanie Trans.eu 30d: {(time.time() - transeu_start)*1000:.0f}ms")
         
+        # NOWE: Pobierz statystyki z zleceń historycznych (ostatnie 6 miesięcy)
+        historical_start = time.time()
+        historical_180d = get_historical_orders_pricing(start_postal, end_postal)  # domyślnie 180 dni
+        logger.info(f"⏱️ Zapytanie Historical Orders 180d: {(time.time() - historical_start)*1000:.0f}ms")
+        
         # Sprawdź czy są jakiekolwiek dane
-        if not timocom_30d and not transeu_30d:
+        if not timocom_30d and not transeu_30d and not historical_180d:
             logger.info(f"ℹ️ No data found for route: {start_postal} -> {end_postal}")
             return jsonify({
                 'success': False,
@@ -885,13 +1330,17 @@ def get_route_pricing():
                 } if timocom_30d else {},
                 'transeu': {
                     '30d': transeu_30d
-                } if transeu_30d else {}
+                } if transeu_30d else {},
+                'historical': {
+                    '180d': historical_180d
+                } if historical_180d else {}
             },
             'currency': 'EUR',
             'unit': 'EUR/km',
             'data_sources': {
                 'timocom': bool(timocom_30d),
-                'transeu': bool(transeu_30d)
+                'transeu': bool(transeu_30d),
+                'historical': bool(historical_180d)
             }
         }
 

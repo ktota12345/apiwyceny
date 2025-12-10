@@ -3,7 +3,10 @@ import json
 
 """
 Test client dla API wyceny tras transportowych
-Zwraca średnie stawki EUR/km z ostatnich 30 dni z giełd TimoCom i Trans.eu
+Zwraca średnie stawki EUR/km:
+- TimoCom i Trans.eu: ostatnie 30 dni
+- Zlecenia historyczne: ostatnie 6 miesięcy (180 dni) z podziałem na FTL i LTL
+  (każdy typ ładunku ma własne statystyki i top 4 przewoźników)
 
 Przykładowa struktura response:
 {
@@ -34,10 +37,75 @@ Przykładowa struktura response:
           "total_offers": 9240,
           "days_with_data": 28
         }
+      },
+      "historical": {
+        "180d": {  # Ostatnie 6 miesięcy - podział na FTL i LTL
+          "FTL": {  # Pełne ładunki (Full Truck Load)
+            "avg_price_per_km": {
+              "client": 0.95,     # Cena sprzedaży
+              "carrier": 0.85     # Koszt realizacji
+            },
+            "median_price_per_km": {
+              "client": 0.92,
+              "carrier": 0.83
+            },
+            "avg_amounts": {
+              "client": 850.50,
+              "carrier": 750.00
+            },
+            "avg_distance": 900.5,
+            "total_orders": 25,
+            "days_with_data": 28,
+            "top_carriers": [    # Top 4 przewoźników FTL
+              {
+                "carrier_id": 123,
+                "carrier_name": "TRANS-POL SP. Z O.O.",
+                "order_count": 15,
+                "avg_client_price_per_km": 0.98,
+                "avg_carrier_price_per_km": 0.88,
+                "avg_client_amount": 880.00,
+                "avg_carrier_amount": 790.00
+              }
+            ]
+          },
+          "LTL": {  # Ładunki częściowe (Less Than Truckload)
+            "avg_price_per_km": {
+              "client": 1.15,
+              "carrier": 1.05
+            },
+            "median_price_per_km": {
+              "client": 1.12,
+              "carrier": 1.03
+            },
+            "avg_amounts": {
+              "client": 450.00,
+              "carrier": 380.00
+            },
+            "avg_distance": 400.0,
+            "total_orders": 20,
+            "days_with_data": 25,
+            "top_carriers": [    # Top 4 przewoźników LTL
+              {
+                "carrier_id": 456,
+                "carrier_name": "EXPRESS-TRANS",
+                "order_count": 10,
+                "avg_client_price_per_km": 1.18,
+                "avg_carrier_price_per_km": 1.08,
+                "avg_client_amount": 480.00,
+                "avg_carrier_amount": 410.00
+              }
+            ]
+          }
+        }
       }
     },
     "currency": "EUR",
-    "unit": "EUR/km"
+    "unit": "EUR/km",
+    "data_sources": {
+      "timocom": true,
+      "transeu": true,
+      "historical": true
+    }
   }
 }
 """
