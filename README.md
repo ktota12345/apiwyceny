@@ -186,15 +186,13 @@ W logach aplikacji zobaczysz szczegółowe metryki:
 ```json
 {
   "start_postal_code": "PL20",
-  "end_postal_code": "DE49",
-  "dystans": 850
+  "end_postal_code": "DE49"
 }
 ```
 
 **Pola:**
 - `start_postal_code` (string, required) - Kod pocztowy startu
 - `end_postal_code` (string, required) - Kod pocztowy celu
-- `dystans` (number, required) - Dystans w kilometrach
 
 **Format kodów pocztowych:**
 - `KOD_KRAJU` (2 litery ISO) + cyfry (1-5 cyfr)
@@ -236,7 +234,7 @@ W logach aplikacji zobaczysz szczegółowe metryki:
 ```json
 {
   "success": false,
-  "error": "Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans"
+  "error": "Brak wszystkich wymaganych pól: start_postal_code, end_postal_code"
 }
 ```
 

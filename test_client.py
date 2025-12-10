@@ -46,8 +46,7 @@ url = "http://127.0.0.1:5003/api/route-pricing"
 
 payload = {
     "start_postal_code": "PL20",
-    "end_postal_code": "DE49",
-    "dystans": 850
+    "end_postal_code": "DE49"
 }
 
 headers = {

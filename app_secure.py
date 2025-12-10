@@ -591,7 +591,6 @@ def get_route_pricing():
           required:
             - start_postal_code
             - end_postal_code
-            - dystans
           properties:
             start_postal_code:
               type: string
@@ -811,12 +810,10 @@ def get_route_pricing():
         
         start_postal = data.get('start_postal_code', '').strip().upper()
         end_postal = data.get('end_postal_code', '').strip().upper()
-        distance = data.get('dystans')
-        
-        if not all([start_postal, end_postal, distance]):
+        if not all([start_postal, end_postal]):
             return jsonify({
                 'success': False,
-                'error': 'Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans'
+                'error': 'Brak wszystkich wymaganych pól: start_postal_code, end_postal_code'
             }), 400
         
         # Walidacja formatów kodów pocztowych
