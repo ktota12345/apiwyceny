@@ -370,20 +370,9 @@ def find_nearest_historical_route(
                 route['end_lat'], route['end_lng']
             )
             
-            # Jeśli punkt końcowy jest za daleko, sprawdź czy jest to najlepsze dopasowanie startu
-            # (może być użyte z flagą low_accuracy)
+            # OBA punkty (start I end) muszą być w promieniu 100km
+            # Jeśli punkt końcowy jest za daleko, pomiń tę trasę całkowicie
             if end_distance > distance_threshold:
-                # Zapisz tylko jeśli to najlepsze dopasowanie startu (do późniejszego użycia)
-                if start_distance < min_start_distance:
-                    min_start_distance = start_distance
-                    if not best_match or best_match.get('end_distance', float('inf')) > distance_threshold:
-                        best_match = {
-                            'matched_start': route['start_code'],
-                            'matched_end': route['end_code'],
-                            'start_distance': start_distance,
-                            'end_distance': end_distance,
-                            'accuracy': 'low'
-                        }
                 continue
             
             # Oba punkty są w zasięgu - wybierz najlepsze dopasowanie
@@ -391,11 +380,11 @@ def find_nearest_historical_route(
             total_distance = start_distance + end_distance
             current_best_total = float('inf')
             
-            if best_match and best_match['accuracy'] != 'low':
+            if best_match:
                 current_best_total = best_match['start_distance'] + best_match['end_distance']
             
-            if total_distance < current_best_total or (best_match and best_match['accuracy'] == 'low'):
-                # Określ poziom dokładności
+            if total_distance < current_best_total:
+                # Określ poziom dokładności (oba punkty są w promieniu 100km)
                 if start_distance < 1 and end_distance < 1:
                     accuracy = 'exact'
                 elif start_distance < 50 and end_distance < 50:
@@ -1445,8 +1434,8 @@ def get_route_pricing():
                                   example: "DE49"
                                 accuracy:
                                   type: string
-                                  description: Poziom dokładności dopasowania
-                                  enum: ["exact", "high", "medium", "low"]
+                                  description: Poziom dokładności dopasowania (oba punkty w promieniu 100km)
+                                  enum: ["exact", "high", "medium"]
                                   example: "exact"
                                 start_distance_km:
                                   type: number

@@ -19,19 +19,22 @@ Użytkownik może zapytać o trasę `PL30 -> DE60`, ale w bazie mamy tylko dane 
 
 2. **Hierarchiczne dopasowanie tras**
    
-   **Krok 1:** Znajdź najbliższy punkt startowy
+   **Krok 1:** Filtruj trasy według punktu startowego
    - Oblicz odległość (Haversine) między żądanym punktem startowym a wszystkimi unikalnymi punktami startowymi w bazie
    - Filtruj tylko te < 100 km
    
-   **Krok 2:** Dla najbliższego punktu startowego, znajdź najbliższy punkt końcowy
-   - Oblicz odległość między żądanym punktem końcowym a punktami końcowymi dla wybranego punktu startowego
+   **Krok 2:** Filtruj według punktu końcowego
+   - Oblicz odległość między żądanym punktem końcowym a punktami końcowymi
+   - **WAŻNE:** OBA punkty (start I end) muszą być w promieniu 100 km
+   - Jeśli którykolwiek punkt jest poza 100 km, trasa jest odrzucana
+   
+   **Krok 3:** Wybierz najlepsze dopasowanie
    - Wybierz trasę z najmniejszą sumą odległości (start + end)
    
-   **Krok 3:** Oceń jakość dopasowania
-   - `exact`: odległości < 1 km (praktycznie ten sam punkt)
-   - `high`: odległości < 50 km (bardzo podobna trasa)
-   - `medium`: odległości < 100 km (podobna trasa)
-   - `low`: punkt startowy < 100 km, ale punkt końcowy > 100 km
+   **Krok 4:** Oceń jakość dopasowania
+   - `exact`: oba punkty < 1 km (praktycznie ten sam punkt)
+   - `high`: oba punkty < 50 km (bardzo podobna trasa)
+   - `medium`: oba punkty < 100 km (podobna trasa)
 
 3. **Zwracanie wyników z metadanymi**
    - Statystyki dla dopasowanej trasy
