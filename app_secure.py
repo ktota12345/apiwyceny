@@ -1460,6 +1460,10 @@ def get_route_pricing():
                   type: string
                   description: Waluta
                   example: "EUR"
+                unit:
+                  type: string
+                  description: Jednostka
+                  example: "EUR/km"
                 route_distance:
                   type: object
                   description: Rzeczywisty dystans drogowy dla ciężarówek (obliczony przez AWS Location Service)
@@ -1473,10 +1477,6 @@ def get_route_pricing():
                       description: Metoda obliczania dystansu
                       enum: ["aws_truck_route", "haversine_fallback"]
                       example: "aws_truck_route"
-                unit:
-                  type: string
-                  description: Jednostka
-                  example: "EUR/km"
                 data_sources:
                   type: object
                   description: Dostępność danych ze źródeł
