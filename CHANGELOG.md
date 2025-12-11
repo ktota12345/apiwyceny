@@ -1,5 +1,65 @@
 # Changelog - Pricing API
 
+## [2.4.0] - 2024-12-11
+
+### 🎯 Fuzzy Matching dla Tras Historycznych
+- **Nowa funkcjonalność:** Inteligentne dopasowanie tras historycznych
+  - API zwraca teraz dane historyczne nawet gdy nie ma dokładnego dopasowania kodów pocztowych
+  - Próg odległości: ±100 km dla punktów startowych i końcowych
+  - Algorytm: najpierw dopasowanie startu, potem końca, wybór najbliższej kombinacji
+
+### 🔧 Uproszczenie API
+- **Usunięto wymagany parametr `dystans`**
+  - API zwraca stawki EUR/km, nie wymaga już dystansu w requestie
+  - Klient może sam obliczyć całkowitą cenę: `stawka × dystans`
+  - Zmniejsza zbędne dane w requestach
+
+### 📍 Poziomy Dokładności Dopasowania
+- **`exact`**: odległości < 1 km (praktycznie identyczne punkty)
+- **`high`**: odległości < 50 km (bardzo podobna trasa)
+- **`medium`**: odległości < 100 km (podobna trasa, akceptowalne dopasowanie)
+- **`low`**: start < 100 km, ale koniec > 100 km (tylko częściowe dopasowanie)
+
+### 🗺️ Wykorzystanie PostalCodeCoordinates
+- Współrzędne geograficzne dla wszystkich unikalnych kodów pocztowych
+- Zapytanie pobiera trasy z ostatnich 180 dni z tabeli `ZleceniaSpeed`
+- Algorytm Haversine dla dokładnych obliczeń odległości geograficznych
+
+### 📊 Rozszerzona Odpowiedź API
+- Dodano `match_info` do sekcji `historical.180d`:
+  ```json
+  "match_info": {
+    "matched_start": "PL22",
+    "matched_end": "DE47", 
+    "accuracy": "high",
+    "start_distance_km": 35.2,
+    "end_distance_km": 42.8
+  }
+  ```
+- Transparentność: użytkownik wie dokładnie, z jakiej trasy pochodzą dane
+
+### 🔧 Implementacja Techniczna
+- **Funkcja `haversine_distance()`**: obliczanie odległości między punktami geograficznymi
+- **Funkcja `get_postal_code_coordinates()`**: pobieranie współrzędnych z cache
+- **Funkcja `find_nearest_historical_route()`**: główna logika fuzzy matching
+- **Modyfikacja `get_historical_orders_pricing()`**: 
+  - Najpierw próba dokładnego dopasowania
+  - Przy braku danych wywołanie fuzzy matching
+  - Dodanie metadata do wyniku
+
+### 📚 Dokumentacja
+- Utworzono `FUZZY_MATCHING_STRATEGY.md` z pełnym opisem algorytmu
+- Zaktualizowano Swagger/OpenAPI dokumentację
+- Dodano rekomendacje UI/UX dla wyświetlania danych z różnymi poziomami accuracy
+
+### 🎨 Korzyści Biznesowe
+- **Lepsza użyteczność**: Dane dostępne dla większej liczby zapytań
+- **Inteligentne fallback**: Zamiast braku danych, system oferuje najbliższą trasę
+- **Wartość dla użytkownika**: Dane z podobnej trasy lepsze niż brak danych
+- **Transparentność**: Pełna informacja o źródle i jakości danych
+
+---
+
 ## [2.2.0] - 2024-12-05
 
 ### 🔧 Critical Data Quality Fix

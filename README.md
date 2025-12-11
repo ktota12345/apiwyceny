@@ -1,23 +1,45 @@
-# 🚚 Pricing API v2.0 - API wyceny tras transportowych
+# 🚚 Pricing API v2.4 - API wyceny tras transportowych
 
-[![Version](https://img.shields.io/badge/version-2.0.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.0-blue.svg)](CHANGELOG.md)
 [![Security](https://img.shields.io/badge/security-enhanced-green.svg)](#security)
 [![Performance](https://img.shields.io/badge/performance-optimized-brightgreen.svg)](#performance)
+[![Fuzzy Matching](https://img.shields.io/badge/fuzzy_matching-enabled-orange.svg)](#fuzzy-matching)
 
-Standalone REST API do kalkulacji cen transportowych na podstawie historycznych danych z giełdy TimoCom.
+Standalone REST API do kalkulacji cen transportowych na podstawie danych z giełd TimoCom, Trans.eu oraz historycznych zleceń firmowych.
 
 ## ✨ Funkcjonalność
 
-API oblicza cenę transportu dla zadanej trasy (kod pocztowy start → kod pocztowy koniec) poprzez:
-1. Mapowanie kodów pocztowych na regiony Trans.eu
-2. Konwersję regionów Trans.eu na regiony TimoCom
-3. Pobranie średnich cen z ostatnich **30 dni** z TimoCom
-4. Obliczenie końcowej ceny: `stawka_za_km * dystans` dla każdego typu pojazdu
+API zwraca średnie stawki transportowe EUR/km dla zadanej trasy poprzez:
+1. **Giełdy transportowe** (ostatnie 30 dni):
+   - TimoCom (trailer, 3.5t, 12t)
+   - Trans.eu (lorry)
+2. **Dane historyczne firmowe** (ostatnie 180 dni):
+   - Podział na FTL (pełne ładunki) i LTL (ładunki częściowe)
+   - Ceny sprzedaży (client) i kosztów (carrier)
+   - Top 4 przewoźników dla każdego typu
+3. **Fuzzy Matching** 🆕 - inteligentne dopasowanie tras:
+   - Gdy brak dokładnego dopasowania kodów pocztowych
+   - Algorytm znajduje najbliższą trasę (±100 km)
+   - Cztery poziomy dokładności: exact, high, medium, low
 
 **Typy pojazdów:**
 - 🚐 **Bus** (do 3.5t)
 - 🚛 **Solo** (do 12t)
 - 🚚 **Naczepa** (trailer)
+
+## 🚀 Co nowego w v2.4?
+
+- 🎯 **Fuzzy Matching** - inteligentne dopasowanie tras gdy brak dokładnego dopasowania
+- 📍 **Transparency** - pełna informacja o źródle i dokładności danych historycznych
+- 🗺️ **Geocoding Cache** - wykorzystanie tabeli PostalCodeCoordinates
+- 📊 **Match Metadata** - accuracy level, odległości punktów startowych i końcowych
+
+## 🚀 Co nowego w v2.3?
+
+- 📊 **Historical Orders** - dane z rzeczywistych zleceń firmowych (180 dni)
+- 🎯 **FTL/LTL Split** - osobne statystyki dla pełnych i częściowych ładunków
+- 👥 **Top Carriers** - ranking najlepszych przewoźników (top 4 dla FTL i LTL)
+- 🔍 **Data Quality** - wykluczenie klienta Motiva i tras < 500 km
 
 ## 🚀 Co nowego w v2.0?
 

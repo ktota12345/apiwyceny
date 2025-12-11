@@ -19,6 +19,11 @@ import secrets
 import re
 import logging
 import time
+import math
+from typing import Dict, Tuple, Optional, List
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'contractorDetails'))
+from aws_distance_calculator import get_aws_route_distance
 
 # Konfiguracja logowania
 logging.basicConfig(
@@ -36,11 +41,12 @@ app = Flask(__name__)
 print("""
 **********************************************
 *                                            *
-*   SECURED & OPTIMIZED PRICING API v2.3    *
+*   SECURED & OPTIMIZED PRICING API v2.4    *
 *   - Single query optimization             *
 *   - Connection pooling with validation    *
 *   - Performance monitoring                *
 *   - Historical orders integration         *
+*   - Fuzzy matching for routes (±100km)    *
 *                                            *
 **********************************************
 """)
@@ -72,7 +78,7 @@ swagger_template = {
             "email": "support@example.com"
         },
         "termsOfService": "#",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "license": {
             "name": "MIT",
             "url": "https://opensource.org/licenses/MIT"
@@ -166,6 +172,257 @@ _POSTAL_CODE_MAPPING = None
 
 # Regex dla walidacji kodu pocztowego (2 litery + 1-5 cyfr)
 POSTAL_CODE_PATTERN = re.compile(r'^[A-Z]{2}\d{1,5}$')
+
+# Stałe dla fuzzy matching
+DISTANCE_THRESHOLD_KM = 100  # próg odległości w km dla dopasowania
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Oblicza odległość w kilometrach między dwoma punktami geograficznymi
+    używając wzoru Haversine.
+    
+    Args:
+        lat1, lon1: Współrzędne punktu 1 (szerokość, długość geograficzna)
+        lat2, lon2: Współrzędne punktu 2 (szerokość, długość geograficzna)
+    
+    Returns:
+        Odległość w kilometrach
+    """
+    # Promień Ziemi w kilometrach
+    R = 6371.0
+    
+    # Konwersja stopni na radiany
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+    
+    # Różnice
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    
+    # Wzór Haversine
+    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    distance = R * c
+    return distance
+
+
+def get_postal_code_coordinates(postal_code: str, conn) -> Optional[Tuple[float, float]]:
+    """
+    Pobiera współrzędne geograficzne dla danego kodu pocztowego z tabeli PostalCodeCoordinates.
+    
+    Args:
+        postal_code: Kod pocztowy (np. "PL20", "DE49")
+        conn: Połączenie z bazą danych
+    
+    Returns:
+        Tuple (lat, lng) lub None jeśli nie znaleziono
+    """
+    try:
+        # Rozdziel kod na country i postal_code (np. "PL20" -> "PL", "20")
+        country = postal_code[:2].upper()
+        code = postal_code[2:]
+        
+        with conn.cursor() as cur:
+            # Najpierw spróbuj dokładnego dopasowania
+            cur.execute("""
+                SELECT lat, lng 
+                FROM "PostalCodeCoordinates"
+                WHERE country = %s AND postal_code = %s
+                LIMIT 1;
+            """, (country, code))
+            
+            result = cur.fetchone()
+            if result:
+                return (result['lat'], result['lng'])
+            
+            # Jeśli nie znaleziono, spróbuj z LIKE (kod może mieć myślnik)
+            cur.execute("""
+                SELECT lat, lng 
+                FROM "PostalCodeCoordinates"
+                WHERE country = %s AND postal_code LIKE %s
+                LIMIT 1;
+            """, (country, f"{code}%"))
+            
+            result = cur.fetchone()
+            if result:
+                return (result['lat'], result['lng'])
+            
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Error getting coordinates for {postal_code}: {e}")
+        return None
+
+
+def find_nearest_historical_route(
+    start_postal: str, 
+    end_postal: str, 
+    conn,
+    distance_threshold: float = DISTANCE_THRESHOLD_KM
+) -> Optional[Dict]:
+    """
+    Znajduje najbliższą trasę historyczną używając fuzzy matching.
+    
+    Algorytm:
+    1. Pobiera współrzędne dla podanych kodów pocztowych
+    2. Znajduje najbliższy kod startowy z historii (< distance_threshold km)
+    3. Dla tego kodu startowego, znajduje najbliższy kod końcowy (< distance_threshold km)
+    4. Zwraca informacje o dopasowanej trasie wraz z flagą dokładności
+    
+    Args:
+        start_postal: Kod pocztowy startu z requestu
+        end_postal: Kod pocztowy końca z requestu
+        conn: Połączenie z bazą danych
+        distance_threshold: Maksymalna odległość w km dla dopasowania (domyślnie 100km)
+    
+    Returns:
+        Dict z informacjami o dopasowanej trasie lub None
+        {
+            'matched_start': str,  # Dopasowany kod startowy
+            'matched_end': str,    # Dopasowany kod końcowy
+            'start_distance': float,  # Odległość od punktu startowego w km
+            'end_distance': float,    # Odległość od punktu końcowego w km
+            'accuracy': str  # 'exact', 'high', 'low'
+        }
+    """
+    try:
+        # 1. Pobierz współrzędne dla podanych kodów
+        start_coords = get_postal_code_coordinates(start_postal, conn)
+        end_coords = get_postal_code_coordinates(end_postal, conn)
+        
+        if not start_coords:
+            logger.warning(f"⚠️ Brak współrzędnych dla kodu startowego: {start_postal}")
+            return None
+        
+        if not end_coords:
+            logger.warning(f"⚠️ Brak współrzędnych dla kodu końcowego: {end_postal}")
+            return None
+        
+        logger.info(f"📍 Request coords: Start {start_postal} {start_coords}, End {end_postal} {end_coords}")
+        
+        # 2. Znajdź wszystkie unikalne trasy historyczne z ich współrzędnymi
+        with conn.cursor() as cur:
+            query = """
+                WITH unique_routes AS (
+                    SELECT DISTINCT
+                        "loadingRegionCode" AS start_code,
+                        "unloadingRegionCode" AS end_code
+                    FROM "ZleceniaSpeed"
+                    WHERE 
+                        "status" = 'Z'
+                        AND "clientId" != 1
+                        AND "routeDistance" > 499
+                        AND "orderDate" >= CURRENT_DATE - INTERVAL '180 days'
+                        AND "cargoType" IN ('FTL', 'LTL')
+                        AND "clientPricePerKm" IS NOT NULL
+                        AND "clientPricePerKm" > 0
+                )
+                SELECT 
+                    ur.start_code,
+                    ur.end_code,
+                    pcc_start.lat AS start_lat,
+                    pcc_start.lng AS start_lng,
+                    pcc_end.lat AS end_lat,
+                    pcc_end.lng AS end_lng
+                FROM unique_routes ur
+                LEFT JOIN "PostalCodeCoordinates" pcc_start 
+                    ON SUBSTRING(ur.start_code FROM 1 FOR 2) = pcc_start.country 
+                    AND pcc_start.postal_code LIKE SUBSTRING(ur.start_code FROM 3) || '%'
+                LEFT JOIN "PostalCodeCoordinates" pcc_end
+                    ON SUBSTRING(ur.end_code FROM 1 FOR 2) = pcc_end.country 
+                    AND pcc_end.postal_code LIKE SUBSTRING(ur.end_code FROM 3) || '%'
+                WHERE 
+                    pcc_start.lat IS NOT NULL 
+                    AND pcc_end.lat IS NOT NULL;
+            """
+            
+            cur.execute(query)
+            historical_routes = cur.fetchall()
+            
+            if not historical_routes:
+                logger.info("ℹ️ Brak tras historycznych z współrzędnymi")
+                return None
+            
+            logger.info(f"🔍 Znaleziono {len(historical_routes)} unikalnych tras historycznych")
+        
+        # 3. Znajdź najbliższy punkt startowy
+        best_match = None
+        min_start_distance = float('inf')
+        
+        for route in historical_routes:
+            # Oblicz odległość punktu startowego
+            start_distance = haversine_distance(
+                start_coords[0], start_coords[1],
+                route['start_lat'], route['start_lng']
+            )
+            
+            # Jeśli punkt startowy jest za daleko, pomiń tę trasę
+            if start_distance > distance_threshold:
+                continue
+            
+            # Oblicz odległość punktu końcowego
+            end_distance = haversine_distance(
+                end_coords[0], end_coords[1],
+                route['end_lat'], route['end_lng']
+            )
+            
+            # Jeśli punkt końcowy jest za daleko, sprawdź czy jest to najlepsze dopasowanie startu
+            # (może być użyte z flagą low_accuracy)
+            if end_distance > distance_threshold:
+                # Zapisz tylko jeśli to najlepsze dopasowanie startu (do późniejszego użycia)
+                if start_distance < min_start_distance:
+                    min_start_distance = start_distance
+                    if not best_match or best_match.get('end_distance', float('inf')) > distance_threshold:
+                        best_match = {
+                            'matched_start': route['start_code'],
+                            'matched_end': route['end_code'],
+                            'start_distance': start_distance,
+                            'end_distance': end_distance,
+                            'accuracy': 'low'
+                        }
+                continue
+            
+            # Oba punkty są w zasięgu - wybierz najlepsze dopasowanie
+            # Priorytet: najmniejsza suma odległości
+            total_distance = start_distance + end_distance
+            current_best_total = float('inf')
+            
+            if best_match and best_match['accuracy'] != 'low':
+                current_best_total = best_match['start_distance'] + best_match['end_distance']
+            
+            if total_distance < current_best_total or (best_match and best_match['accuracy'] == 'low'):
+                # Określ poziom dokładności
+                if start_distance < 1 and end_distance < 1:
+                    accuracy = 'exact'
+                elif start_distance < 50 and end_distance < 50:
+                    accuracy = 'high'
+                else:
+                    accuracy = 'medium'
+                
+                best_match = {
+                    'matched_start': route['start_code'],
+                    'matched_end': route['end_code'],
+                    'start_distance': start_distance,
+                    'end_distance': end_distance,
+                    'accuracy': accuracy
+                }
+        
+        if best_match:
+            logger.info(f"✅ Znaleziono dopasowanie: {best_match['matched_start']}->{best_match['matched_end']} "
+                       f"(start: {best_match['start_distance']:.1f}km, end: {best_match['end_distance']:.1f}km, "
+                       f"accuracy: {best_match['accuracy']})")
+        else:
+            logger.info("ℹ️ Nie znaleziono dopasowania w promieniu 100km")
+        
+        return best_match
+        
+    except Exception as e:
+        logger.error(f"❌ Error in find_nearest_historical_route: {e}", exc_info=True)
+        return None
 
 
 @app.after_request
@@ -550,7 +807,12 @@ def get_transeu_pricing(start_region_id: int, end_region_id: int, days: int = 7)
 
 def get_historical_orders_pricing(start_region_code: str, end_region_code: str, days: int = 180):
     """
-    Pobiera statystyki z tabeli zleceń historycznych (ZleceniaSpeed)
+    Pobiera statystyki z tabeli zleceń historycznych (ZleceniaSpeed) z fuzzy matching.
+    
+    Algorytm:
+    1. Najpierw próbuje dokładnego dopasowania kodów pocztowych
+    2. Jeśli nie znajdzie, używa fuzzy matching (najbliższe punkty w promieniu 100km)
+    3. Zwraca dane ze wskaźnikiem dokładności dopasowania
     
     Args:
         start_region_code: Kod regionu startu (np. "PL20")
@@ -558,14 +820,25 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
         days: Liczba dni wstecz (domyślnie 180 - ostatnie pół roku)
     
     Returns:
-        Słownik ze statystykami (w tym top 4 przewoźników) lub None jeśli brak danych
+        Słownik ze statystykami (w tym top 4 przewoźników) oraz metadata o dopasowaniu
+        lub None jeśli brak danych
     """
+    logger.info(f"🔍 get_historical_orders_pricing called: {start_region_code} → {end_region_code}")
     start_time = time.time()
     conn = None
     try:
         conn_start = time.time()
         conn = _get_db_connection_main()
         logger.info(f"⏱️ Połączenie z bazą (historical): {(time.time() - conn_start)*1000:.0f}ms")
+        
+        # Metadata o dopasowaniu (domyślnie exact match)
+        match_metadata = {
+            'matched_start': start_region_code,
+            'matched_end': end_region_code,
+            'accuracy': 'exact',
+            'start_distance_km': 0.0,
+            'end_distance_km': 0.0
+        }
         
         with conn.cursor() as cur:
             # Próg dla outlierów - analogiczny do giełd
@@ -684,7 +957,42 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
             
             # Przetwarzanie zagregowanych danych
             if not result or not result['aggregated']:
-                return None
+                # BRAK DOKŁADNEGO DOPASOWANIA - spróbuj fuzzy matching
+                logger.info(f"ℹ️ Brak dokładnego dopasowania dla {start_region_code}->{end_region_code}, próbuję fuzzy matching...")
+                
+                fuzzy_match = find_nearest_historical_route(start_region_code, end_region_code, conn)
+                
+                if not fuzzy_match:
+                    logger.info("ℹ️ Fuzzy matching nie znalazł dopasowania")
+                    return None
+                
+                # Znaleziono fuzzy match - pobierz dane dla dopasowanej trasy
+                logger.info(f"🎯 Używam fuzzy match: {fuzzy_match['matched_start']}->{fuzzy_match['matched_end']}")
+                
+                # Aktualizuj metadata
+                match_metadata = {
+                    'matched_start': fuzzy_match['matched_start'],
+                    'matched_end': fuzzy_match['matched_end'],
+                    'accuracy': fuzzy_match['accuracy'],
+                    'start_distance_km': round(fuzzy_match['start_distance'], 2),
+                    'end_distance_km': round(fuzzy_match['end_distance'], 2)
+                }
+                
+                # Wykonaj zapytanie ponownie z dopasowanymi kodami
+                query_start = time.time()
+                cur.execute(query, {
+                    'start_code': fuzzy_match['matched_start'],
+                    'end_code': fuzzy_match['matched_end'],
+                    'days': days,
+                    'threshold': OUTLIER_THRESHOLD
+                })
+                result = cur.fetchone()
+                logger.info(f"⏱️ Zapytanie SQL fuzzy match (historical {days}d): {(time.time() - query_start)*1000:.0f}ms")
+                
+                # Sprawdź czy są dane dla dopasowanej trasy
+                if not result or not result['aggregated']:
+                    logger.warning("⚠️ Brak danych nawet dla dopasowanej trasy")
+                    return None
             
             # Sprawdź czy są jakiekolwiek dane
             if not result['aggregated'] or len(result['aggregated']) == 0:
@@ -745,7 +1053,10 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
             if not ftl_data and not ltl_data:
                 return None
             
-            result_data = {}
+            result_data = {
+                'match_info': match_metadata  # Informacja o dopasowaniu
+            }
+            
             if ftl_data:
                 result_data['FTL'] = ftl_data
             if ltl_data:
@@ -797,14 +1108,15 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'service': 'Pricing API (Secured & Optimized)',
-        'version': '2.3.0',
+        'version': '2.4.0',
         'features': {
             'security': 'API Key + Rate Limiting + HTTPS',
             'optimization': 'Single optimized query per data source',
             'monitoring': 'Performance metrics enabled',
             'data_sources': 'TimoCom + Trans.eu exchanges + Historical orders',
             'data': 'Weighted avg rates EUR/km from exchanges and real orders',
-            'data_quality': 'Outlier filtering (>5 EUR/km removed)'
+            'data_quality': 'Outlier filtering (>5 EUR/km removed)',
+            'fuzzy_matching': 'Intelligent route matching (±100km threshold) with accuracy levels'
         }
     })
 
@@ -849,11 +1161,6 @@ def get_route_pricing():
               description: Kod pocztowy miejsca docelowego (format ISO 2-literowy kod kraju + cyfry, np. "DE49", "FR75")
               example: "DE49"
               pattern: "^[A-Z]{2}\\d{1,5}$"
-            dystans:
-              type: number
-              description: Dystans trasy w kilometrach
-              example: 850
-              minimum: 1
     responses:
       200:
         description: Sukces - średnie stawki z giełd (30 dni) i zleceń historycznych (180 dni z top przewoźnikami)
@@ -1124,10 +1431,48 @@ def get_route_pricing():
                                         type: number
                                         example: 410.00
                                         nullable: true
+                            match_info:
+                              type: object
+                              description: Informacje o dopasowaniu tras (fuzzy matching)
+                              properties:
+                                matched_start:
+                                  type: string
+                                  description: Faktyczny kod startowy użyty do statystyk
+                                  example: "PL20"
+                                matched_end:
+                                  type: string
+                                  description: Faktyczny kod końcowy użyty do statystyk
+                                  example: "DE49"
+                                accuracy:
+                                  type: string
+                                  description: Poziom dokładności dopasowania
+                                  enum: ["exact", "high", "medium", "low"]
+                                  example: "exact"
+                                start_distance_km:
+                                  type: number
+                                  description: Odległość między żądanym a dopasowanym punktem startowym (km)
+                                  example: 0.0
+                                end_distance_km:
+                                  type: number
+                                  description: Odległość między żądanym a dopasowanym punktem końcowym (km)
+                                  example: 0.0
                 currency:
                   type: string
                   description: Waluta
                   example: "EUR"
+                route_distance:
+                  type: object
+                  description: Rzeczywisty dystans drogowy dla ciężarówek (obliczony przez AWS Location Service)
+                  properties:
+                    distance_km:
+                      type: number
+                      description: Dystans w kilometrach
+                      example: 587.45
+                    method:
+                      type: string
+                      description: Metoda obliczania dystansu
+                      enum: ["aws_truck_route", "haversine_fallback"]
+                      example: "aws_truck_route"
                 unit:
                   type: string
                   description: Jednostka
@@ -1155,7 +1500,7 @@ def get_route_pricing():
               example: false
             error:
               type: string
-              example: "Brak wszystkich wymaganych pól: start_postal_code, end_postal_code, dystans"
+              example: "Brak wszystkich wymaganych pól: start_postal_code, end_postal_code"
       401:
         description: Nieautoryzowany - brak klucza API
         schema:
@@ -1272,6 +1617,44 @@ def get_route_pricing():
         
         request_start = time.time()
         
+        # NOWE: Oblicz rzeczywisty dystans drogowy dla ciężarówek używając AWS Location Service
+        route_distance_km = None
+        distance_method = None
+        
+        # Pobierz współrzędne dla kodów pocztowych
+        conn_main = _get_db_connection_main()
+        try:
+            start_coords = get_postal_code_coordinates(start_postal, conn_main)
+            end_coords = get_postal_code_coordinates(end_postal, conn_main)
+            
+            if start_coords and end_coords:
+                logger.info(f"📍 Coordinates: Start {start_postal} ({start_coords[0]:.5f}, {start_coords[1]:.5f}), End {end_postal} ({end_coords[0]:.5f}, {end_coords[1]:.5f})")
+                
+                # Wywołaj AWS API
+                aws_start = time.time()
+                aws_result = get_aws_route_distance(
+                    start_lat=start_coords[0],
+                    start_lng=start_coords[1],
+                    end_lat=end_coords[0],
+                    end_lng=end_coords[1],
+                    return_geometry=False
+                )
+                
+                if aws_result:
+                    route_distance_km = aws_result['distance']
+                    distance_method = 'aws_truck_route'
+                    logger.info(f"⏱️ AWS Route Distance: {route_distance_km} km ({(time.time() - aws_start)*1000:.0f}ms)")
+                else:
+                    # Fallback do Haversine
+                    haversine_dist = haversine_distance(start_coords[0], start_coords[1], end_coords[0], end_coords[1])
+                    route_distance_km = round(haversine_dist * 1.3, 2)  # Współczynnik drogi 1.3
+                    distance_method = 'haversine_fallback'
+                    logger.info(f"⚠️ AWS failed, using Haversine fallback: {route_distance_km} km")
+            else:
+                logger.warning(f"⚠️ Could not get coordinates for distance calculation")
+        finally:
+            _return_db_connection_main(conn_main)
+        
         # OPTYMALIZACJA: Pobierz tylko dane z 30 dni z obu giełd
         timocom_start = time.time()
         timocom_30d = get_timocom_pricing(start_region_id, end_region_id, days=30)
@@ -1282,6 +1665,7 @@ def get_route_pricing():
         logger.info(f"⏱️ Zapytanie Trans.eu 30d: {(time.time() - transeu_start)*1000:.0f}ms")
         
         # NOWE: Pobierz statystyki z zleceń historycznych (ostatnie 6 miesięcy)
+        logger.info(f"📊 Calling get_historical_orders_pricing({start_postal}, {end_postal})")
         historical_start = time.time()
         historical_180d = get_historical_orders_pricing(start_postal, end_postal)  # domyślnie 180 dni
         logger.info(f"⏱️ Zapytanie Historical Orders 180d: {(time.time() - historical_start)*1000:.0f}ms")
@@ -1343,6 +1727,13 @@ def get_route_pricing():
                 'historical': bool(historical_180d)
             }
         }
+        
+        # Dodaj dystans drogowy jeśli został obliczony
+        if route_distance_km is not None:
+            response_data['route_distance'] = {
+                'distance_km': route_distance_km,
+                'method': distance_method
+            }
 
         return jsonify({
             'success': True,
