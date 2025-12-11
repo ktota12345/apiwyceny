@@ -341,6 +341,7 @@ def find_nearest_historical_route(
                     JOIN "PostalCodeCoordinates" pcc
                         ON SUBSTRING(ur.start_code FROM 1 FOR 2) = pcc.country 
                         AND pcc.postal_code LIKE SUBSTRING(ur.start_code FROM 3) || '%'
+                    ORDER BY ur.start_code, pcc.postal_code
                 ),
                 coords_end AS (
                     SELECT DISTINCT ON (ur.end_code)
@@ -351,6 +352,7 @@ def find_nearest_historical_route(
                     JOIN "PostalCodeCoordinates" pcc
                         ON SUBSTRING(ur.end_code FROM 1 FOR 2) = pcc.country 
                         AND pcc.postal_code LIKE SUBSTRING(ur.end_code FROM 3) || '%'
+                    ORDER BY ur.end_code, pcc.postal_code
                 )
                 SELECT 
                     ur.start_code,
