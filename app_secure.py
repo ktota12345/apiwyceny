@@ -28,7 +28,8 @@ from aws_distance_calculator import get_aws_route_distance
 # Konfiguracja logowania
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True
 )
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,16 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
+
+# Konfiguruj Flask logger
+app.logger.setLevel(logging.INFO)
+# Dodaj handler do Flask loggera
+if not app.logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    app.logger.addHandler(handler)
 
 # STARTUP LOG - WERSJA Z OPTYMALIZACJĄ
 print("""
@@ -320,24 +331,37 @@ def find_nearest_historical_route(
                         AND "cargoType" IN ('FTL', 'LTL')
                         AND "clientPricePerKm" IS NOT NULL
                         AND "clientPricePerKm" > 0
+                ),
+                coords_start AS (
+                    SELECT DISTINCT ON (ur.start_code)
+                        ur.start_code,
+                        pcc.lat,
+                        pcc.lng
+                    FROM unique_routes ur
+                    JOIN "PostalCodeCoordinates" pcc
+                        ON SUBSTRING(ur.start_code FROM 1 FOR 2) = pcc.country 
+                        AND pcc.postal_code LIKE SUBSTRING(ur.start_code FROM 3) || '%'
+                ),
+                coords_end AS (
+                    SELECT DISTINCT ON (ur.end_code)
+                        ur.end_code,
+                        pcc.lat,
+                        pcc.lng
+                    FROM unique_routes ur
+                    JOIN "PostalCodeCoordinates" pcc
+                        ON SUBSTRING(ur.end_code FROM 1 FOR 2) = pcc.country 
+                        AND pcc.postal_code LIKE SUBSTRING(ur.end_code FROM 3) || '%'
                 )
                 SELECT 
                     ur.start_code,
                     ur.end_code,
-                    pcc_start.lat AS start_lat,
-                    pcc_start.lng AS start_lng,
-                    pcc_end.lat AS end_lat,
-                    pcc_end.lng AS end_lng
+                    cs.lat AS start_lat,
+                    cs.lng AS start_lng,
+                    ce.lat AS end_lat,
+                    ce.lng AS end_lng
                 FROM unique_routes ur
-                LEFT JOIN "PostalCodeCoordinates" pcc_start 
-                    ON SUBSTRING(ur.start_code FROM 1 FOR 2) = pcc_start.country 
-                    AND pcc_start.postal_code LIKE SUBSTRING(ur.start_code FROM 3) || '%'
-                LEFT JOIN "PostalCodeCoordinates" pcc_end
-                    ON SUBSTRING(ur.end_code FROM 1 FOR 2) = pcc_end.country 
-                    AND pcc_end.postal_code LIKE SUBSTRING(ur.end_code FROM 3) || '%'
-                WHERE 
-                    pcc_start.lat IS NOT NULL 
-                    AND pcc_end.lat IS NOT NULL;
+                JOIN coords_start cs ON ur.start_code = cs.start_code
+                JOIN coords_end ce ON ur.end_code = ce.end_code;
             """
             
             cur.execute(query)
@@ -1114,7 +1138,7 @@ def health_check():
 @require_api_key
 @limiter.limit("5 per minute")  # Max 5 requestów na minutę
 def get_route_pricing():
-    """Pobierz dane cenowe dla trasy transportowej
+    r"""Pobierz dane cenowe dla trasy transportowej
     Endpoint zwraca średnie stawki transportowe EUR/km z trzech źródeł:
     - TimoCom: ostatnie 30 dni (różne typy pojazdów)
     - Trans.eu: ostatnie 30 dni
@@ -1609,12 +1633,16 @@ def get_route_pricing():
         # NOWE: Oblicz rzeczywisty dystans drogowy dla ciężarówek używając AWS Location Service
         route_distance_km = None
         distance_method = None
+        aws_time = 0
         
         # Pobierz współrzędne dla kodów pocztowych
+        geocoding_start = time.time()
         conn_main = _get_db_connection_main()
         try:
             start_coords = get_postal_code_coordinates(start_postal, conn_main)
             end_coords = get_postal_code_coordinates(end_postal, conn_main)
+            geocoding_time = (time.time() - geocoding_start) * 1000
+            logger.info(f"⏱️ Geocoding: {geocoding_time:.0f}ms")
             
             if start_coords and end_coords:
                 logger.info(f"📍 Coordinates: Start {start_postal} ({start_coords[0]:.5f}, {start_coords[1]:.5f}), End {end_postal} ({end_coords[0]:.5f}, {end_coords[1]:.5f})")
@@ -1629,16 +1657,18 @@ def get_route_pricing():
                     return_geometry=False
                 )
                 
+                aws_time = (time.time() - aws_start) * 1000
                 if aws_result:
                     route_distance_km = aws_result['distance']
                     distance_method = 'aws_truck_route'
-                    logger.info(f"⏱️ AWS Route Distance: {route_distance_km} km ({(time.time() - aws_start)*1000:.0f}ms)")
+                    logger.info(f"⏱️ AWS Route Distance: {route_distance_km} km ({aws_time:.0f}ms)")
                 else:
                     # Fallback do Haversine
                     haversine_dist = haversine_distance(start_coords[0], start_coords[1], end_coords[0], end_coords[1])
                     route_distance_km = round(haversine_dist * 1.3, 2)  # Współczynnik drogi 1.3
                     distance_method = 'haversine_fallback'
-                    logger.info(f"⚠️ AWS failed, using Haversine fallback: {route_distance_km} km")
+                    logger.info(f"⚠️ AWS failed ({aws_time:.0f}ms), using Haversine fallback: {route_distance_km} km")
+                    aws_time = 0  # Reset for summary
             else:
                 logger.warning(f"⚠️ Could not get coordinates for distance calculation")
         finally:
@@ -1647,17 +1677,20 @@ def get_route_pricing():
         # OPTYMALIZACJA: Pobierz tylko dane z 30 dni z obu giełd
         timocom_start = time.time()
         timocom_30d = get_timocom_pricing(start_region_id, end_region_id, days=30)
-        logger.info(f"⏱️ Zapytanie TimoCom 30d: {(time.time() - timocom_start)*1000:.0f}ms")
+        timocom_time = (time.time() - timocom_start) * 1000
+        logger.info(f"⏱️ Zapytanie TimoCom 30d: {timocom_time:.0f}ms")
         
         transeu_start = time.time()
         transeu_30d = get_transeu_pricing(start_region_id, end_region_id, days=30)
-        logger.info(f"⏱️ Zapytanie Trans.eu 30d: {(time.time() - transeu_start)*1000:.0f}ms")
+        transeu_time = (time.time() - transeu_start) * 1000
+        logger.info(f"⏱️ Zapytanie Trans.eu 30d: {transeu_time:.0f}ms")
         
         # NOWE: Pobierz statystyki z zleceń historycznych (ostatnie 6 miesięcy)
         logger.info(f"📊 Calling get_historical_orders_pricing({start_postal}, {end_postal})")
         historical_start = time.time()
         historical_180d = get_historical_orders_pricing(start_postal, end_postal)  # domyślnie 180 dni
-        logger.info(f"⏱️ Zapytanie Historical Orders 180d: {(time.time() - historical_start)*1000:.0f}ms")
+        historical_time = (time.time() - historical_start) * 1000
+        logger.info(f"⏱️ Zapytanie Historical Orders 180d: {historical_time:.0f}ms")
         
         # Sprawdź czy są jakiekolwiek dane
         if not timocom_30d and not transeu_30d and not historical_180d:
@@ -1688,7 +1721,17 @@ def get_route_pricing():
         #         calculated_prices[f'cena_{vehicle_key}'] = None
         # logger.info(f"⏱️ Obliczenia cen: {(time.time() - calc_start)*1000:.0f}ms")
         
-        logger.info(f"⏱️ ⭐ CAŁKOWITY CZAS REQUESTU: {(time.time() - request_start)*1000:.0f}ms")
+        total_time = (time.time() - request_start) * 1000
+        logger.info(f"")
+        logger.info(f"⏱️ ⭐ CAŁKOWITY CZAS REQUESTU: {total_time:.0f}ms")
+        logger.info(f"📊 BREAKDOWN:")
+        logger.info(f"   1️⃣ Geocoding:        {geocoding_time:6.0f}ms ({geocoding_time/total_time*100:5.1f}%)")
+        if aws_time > 0:
+            logger.info(f"   2️⃣ AWS Distance:     {aws_time:6.0f}ms ({aws_time/total_time*100:5.1f}%)")
+        logger.info(f"   3️⃣ TimoCom query:    {timocom_time:6.0f}ms ({timocom_time/total_time*100:5.1f}%)")
+        logger.info(f"   4️⃣ Trans.eu query:   {transeu_time:6.0f}ms ({transeu_time/total_time*100:5.1f}%)")
+        logger.info(f"   5️⃣ Historical query: {historical_time:6.0f}ms ({historical_time/total_time*100:5.1f}%)")
+        logger.info(f"")
         logger.info(f"✅ Successfully returned pricing data for {start_postal} -> {end_postal}")
 
         # Przygotuj response ze stawkami średnimi z 30 dni
