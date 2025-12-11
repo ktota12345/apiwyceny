@@ -1155,12 +1155,12 @@ def get_route_pricing():
               type: string
               description: Kod pocztowy miejsca początkowego (format ISO 2-literowy kod kraju + cyfry, np. "PL20", "DE49")
               example: "PL20"
-              pattern: "^[A-Z]{2}\\d{1,5}$"
+              pattern: '^[A-Z]{2}\d{1,5}$'
             end_postal_code:
               type: string
               description: Kod pocztowy miejsca docelowego (format ISO 2-literowy kod kraju + cyfry, np. "DE49", "FR75")
               example: "DE49"
-              pattern: "^[A-Z]{2}\\d{1,5}$"
+              pattern: '^[A-Z]{2}\d{1,5}$'
     responses:
       200:
         description: Sukces - średnie stawki z giełd (30 dni) i zleceń historycznych (180 dni z top przewoźnikami)
