@@ -886,8 +886,8 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                         AND "clientPricePerKm" IS NOT NULL
                         AND "clientPricePerKm" > 0
                         AND "cargoType" IN ('FTL', 'LTL')  -- Tylko FTL i LTL
-                        AND "clientId" != 1  -- Pomijamy klienta Motiva (id = 1)
-                        AND "routeDistance" > 499  -- Tylko trasy powyżej 499 km
+                        AND "carrierName" NOT ILIKE '%motiva%'  -- Pomijamy przewoźnika Motiva
+                        AND "carrierName" NOT ILIKE '%ALB LOGISTICS%'  -- Pomijamy ALB LOGISTICS
                 ),
                 outliers AS (
                     SELECT
@@ -1090,8 +1090,8 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                     AND "clientPricePerKm" IS NOT NULL
                     AND "clientPricePerKm" > 0
                     AND "cargoType" IN ('FTL', 'LTL')
-                    AND "clientId" != 1
-                    AND "routeDistance" > 499
+                    AND "carrierName" NOT ILIKE '%motiva%'
+                    AND "carrierName" NOT ILIKE '%ALB LOGISTICS%'
                 ORDER BY "orderDate" DESC;
             """
             
