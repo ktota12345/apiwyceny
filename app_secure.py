@@ -867,16 +867,30 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                         "carrierId",
                         "carrierName",
                         "cargoType",
-                        "clientPricePerKm",
-                        "carrierPricePerKm",
-                        "clientAmount",
-                        "carrierAmount",
+                        -- Przelicz PLN na EUR (kurs 4.25)
+                        CASE 
+                            WHEN "clientCurrency" = 'PLN' THEN "clientPricePerKm" / 4.25
+                            ELSE "clientPricePerKm"
+                        END AS "clientPricePerKm",
+                        CASE 
+                            WHEN "carrierCurrency" = 'PLN' THEN "carrierPricePerKm" / 4.25
+                            ELSE "carrierPricePerKm"
+                        END AS "carrierPricePerKm",
+                        CASE 
+                            WHEN "clientCurrency" = 'PLN' THEN "clientAmount" / 4.25
+                            ELSE "clientAmount"
+                        END AS "clientAmount",
+                        CASE 
+                            WHEN "carrierCurrency" = 'PLN' THEN "carrierAmount" / 4.25
+                            ELSE "carrierAmount"
+                        END AS "carrierAmount",
                         "routeDistance",
                         "clientCurrency",
                         "carrierCurrency",
                         "status",
-                        -- Outlier: cena za km > 5 EUR
-                        ("clientPricePerKm" > %(threshold)s OR "carrierPricePerKm" > %(threshold)s) AS is_outlier
+                        -- Outlier: cena za km > 5 EUR (po przeliczeniu)
+                        (CASE WHEN "clientCurrency" = 'PLN' THEN "clientPricePerKm" / 4.25 ELSE "clientPricePerKm" END > %(threshold)s OR 
+                         CASE WHEN "carrierCurrency" = 'PLN' THEN "carrierPricePerKm" / 4.25 ELSE "carrierPricePerKm" END > %(threshold)s) AS is_outlier
                     FROM "ZleceniaSpeed"
                     WHERE
                         "loadingRegionCode" = %(start_code)s
@@ -887,6 +901,8 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                         AND "clientPricePerKm" > 0
                         AND "cargoType" IN ('FTL', 'LTL')  -- Tylko FTL i LTL
                         AND ("carrierName" IS NULL OR ("carrierName" NOT ILIKE '%%motiva%%' AND "carrierName" NOT ILIKE '%%ALB LOGISTICS%%'))  -- Pomijamy Motiva i ALB LOGISTICS jako przewoźników
+                        AND "clientCurrency" IN ('EUR', 'PLN')  -- Tylko EUR i PLN
+                        AND "carrierCurrency" IN ('EUR', 'PLN')  -- Tylko EUR i PLN
                 ),
                 outliers AS (
                     SELECT
@@ -921,6 +937,10 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                         
                         -- Średni dystans
                         AVG("routeDistance") AS avg_distance,
+                        
+                        -- Waluty (powinny być wszystkie EUR po filtrze)
+                        MAX("clientCurrency") AS client_currency,
+                        MAX("carrierCurrency") AS carrier_currency,
                         
                         -- Liczba zleceń
                         COUNT(*) AS total_orders,
@@ -1034,6 +1054,10 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                         'carrier': float(agg_data['avg_carrier_amount']) if agg_data.get('avg_carrier_amount') else None
                     },
                     'avg_distance': float(agg_data['avg_distance']) if agg_data.get('avg_distance') else None,
+                    'currency': {
+                        'client': agg_data.get('client_currency', 'EUR'),
+                        'carrier': agg_data.get('carrier_currency', 'EUR')
+                    },
                     'total_orders': int(agg_data['total_orders']) if agg_data.get('total_orders') else 0,
                     'days_with_data': int(agg_data['days_count']) if agg_data.get('days_count') else 0,
                     'top_carriers': []
@@ -1070,11 +1094,14 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
             # Pobierz szczegółową listę wszystkich zleceń dla tej trasy
             orders_list_query = """
                 SELECT
+                    "id",
                     "orderDate",
                     "cargoType",
                     "clientAmount",
                     "carrierAmount",
                     "carrierName",
+                    "carrierContact",
+                    "carrierEmail",
                     "clientPricePerKm",
                     "carrierPricePerKm",
                     "routeDistance",
@@ -1106,11 +1133,14 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
             orders_list = []
             for order in orders_raw:
                 orders_list.append({
+                    'order_id': order['id'],
                     'order_date': order['orderDate'].isoformat() if order['orderDate'] else None,
                     'cargo_type': order['cargoType'],
                     'client_amount': float(order['clientAmount']) if order['clientAmount'] else None,
                     'carrier_amount': float(order['carrierAmount']) if order['carrierAmount'] else None,
                     'carrier_name': order['carrierName'],
+                    'carrier_contact': order['carrierContact'],
+                    'carrier_email': order['carrierEmail'],
                     'client_price_per_km': float(order['clientPricePerKm']) if order['clientPricePerKm'] else None,
                     'carrier_price_per_km': float(order['carrierPricePerKm']) if order['carrierPricePerKm'] else None,
                     'route_distance': float(order['routeDistance']) if order['routeDistance'] else None,
@@ -1509,6 +1539,16 @@ def get_route_pricing():
                                   type: number
                                   example: 400.0
                                   nullable: true
+                                currency:
+                                  type: object
+                                  description: Waluty oryginalne (PLN jest przeliczane na EUR po kursie 4.25, ale oryginalna waluta jest zachowana)
+                                  properties:
+                                    client:
+                                      type: string
+                                      example: "EUR"
+                                    carrier:
+                                      type: string
+                                      example: "EUR"
                                 total_orders:
                                   type: integer
                                   example: 20
@@ -1552,6 +1592,10 @@ def get_route_pricing():
                               items:
                                 type: object
                                 properties:
+                                  order_id:
+                                    type: integer
+                                    description: ID zlecenia
+                                    example: 12345
                                   order_date:
                                     type: string
                                     format: date
@@ -1576,6 +1620,16 @@ def get_route_pricing():
                                     type: string
                                     description: Nazwa przewoźnika
                                     example: "TRANS-POL SP. Z O.O."
+                                  carrier_contact:
+                                    type: string
+                                    description: Kontakt do przewoźnika
+                                    example: "+48 123 456 789"
+                                    nullable: true
+                                  carrier_email:
+                                    type: string
+                                    description: Email przewoźnika
+                                    example: "kontakt@transpol.pl"
+                                    nullable: true
                                   client_price_per_km:
                                     type: number
                                     description: Cena klienta za km
