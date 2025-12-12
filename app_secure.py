@@ -1068,8 +1068,59 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
             if not ftl_data and not ltl_data:
                 return None
             
+            # Pobierz szczegółową listę wszystkich zleceń dla tej trasy
+            orders_list_query = """
+                SELECT
+                    "orderDate",
+                    "cargoType",
+                    "clientAmount",
+                    "carrierAmount",
+                    "carrierName",
+                    "clientPricePerKm",
+                    "carrierPricePerKm",
+                    "routeDistance",
+                    "clientCurrency",
+                    "carrierCurrency"
+                FROM "ZleceniaSpeed"
+                WHERE
+                    "loadingRegionCode" = %(start_code)s
+                    AND "unloadingRegionCode" = %(end_code)s
+                    AND "orderDate" >= CURRENT_DATE - CAST(%(days)s AS INTEGER)
+                    AND "status" = 'Z'
+                    AND "clientPricePerKm" IS NOT NULL
+                    AND "clientPricePerKm" > 0
+                    AND "cargoType" IN ('FTL', 'LTL')
+                    AND "clientId" != 1
+                    AND "routeDistance" > 499
+                ORDER BY "orderDate" DESC;
+            """
+            
+            cur.execute(orders_list_query, {
+                'start_code': match_metadata['matched_start'],
+                'end_code': match_metadata['matched_end'],
+                'days': days
+            })
+            orders_raw = cur.fetchall()
+            
+            # Formatuj listę zleceń
+            orders_list = []
+            for order in orders_raw:
+                orders_list.append({
+                    'order_date': order['orderDate'].isoformat() if order['orderDate'] else None,
+                    'cargo_type': order['cargoType'],
+                    'client_amount': float(order['clientAmount']) if order['clientAmount'] else None,
+                    'carrier_amount': float(order['carrierAmount']) if order['carrierAmount'] else None,
+                    'carrier_name': order['carrierName'],
+                    'client_price_per_km': float(order['clientPricePerKm']) if order['clientPricePerKm'] else None,
+                    'carrier_price_per_km': float(order['carrierPricePerKm']) if order['carrierPricePerKm'] else None,
+                    'route_distance': float(order['routeDistance']) if order['routeDistance'] else None,
+                    'client_currency': order['clientCurrency'],
+                    'carrier_currency': order['carrierCurrency']
+                })
+            
             result_data = {
-                'match_info': match_metadata  # Informacja o dopasowaniu
+                'match_info': match_metadata,  # Informacja o dopasowaniu
+                'orders': orders_list  # Lista wszystkich zleceń
             }
             
             if ftl_data:
@@ -1077,6 +1128,7 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
             if ltl_data:
                 result_data['LTL'] = ltl_data
             
+            logger.info(f"📋 Zwracam {len(orders_list)} zleceń historycznych")
             return result_data
             
     except Exception as exc:
@@ -1242,6 +1294,22 @@ def get_route_pricing():
                                   type: number
                                   example: 1.55
                                   nullable: true
+                            total_price:
+                              type: object
+                              description: Ceny całkowite (dystans × stawka) w EUR
+                              properties:
+                                trailer:
+                                  type: number
+                                  example: 880.50
+                                  nullable: true
+                                3_5t:
+                                  type: number
+                                  example: 587.00
+                                  nullable: true
+                                12t:
+                                  type: number
+                                  example: 704.40
+                                  nullable: true
                             total_offers:
                               type: integer
                               description: Całkowita liczba ofert
@@ -1272,6 +1340,14 @@ def get_route_pricing():
                                 lorry:
                                   type: number
                                   example: 0.89
+                                  nullable: true
+                            total_price:
+                              type: object
+                              description: Ceny całkowite (dystans × stawka) w EUR
+                              properties:
+                                lorry:
+                                  type: number
+                                  example: 511.08
                                   nullable: true
                             total_offers:
                               type: integer
@@ -1315,6 +1391,18 @@ def get_route_pricing():
                                     carrier:
                                       type: number
                                       example: 0.83
+                                      nullable: true
+                                total_price:
+                                  type: object
+                                  description: Ceny całkowite (dystans AWS × średnia stawka) w EUR
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 558.15
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 499.35
                                       nullable: true
                                 avg_amounts:
                                   type: object
@@ -1394,6 +1482,18 @@ def get_route_pricing():
                                       type: number
                                       example: 1.03
                                       nullable: true
+                                total_price:
+                                  type: object
+                                  description: Ceny całkowite (dystans AWS × średnia stawka) w EUR
+                                  properties:
+                                    client:
+                                      type: number
+                                      example: 675.57
+                                      nullable: true
+                                    carrier:
+                                      type: number
+                                      example: 616.83
+                                      nullable: true
                                 avg_amounts:
                                   type: object
                                   properties:
@@ -1446,6 +1546,57 @@ def get_route_pricing():
                                         type: number
                                         example: 410.00
                                         nullable: true
+                            orders:
+                              type: array
+                              description: Lista wszystkich zleceń historycznych dla tej trasy
+                              items:
+                                type: object
+                                properties:
+                                  order_date:
+                                    type: string
+                                    format: date
+                                    description: Data realizacji zlecenia
+                                    example: "2025-11-15"
+                                  cargo_type:
+                                    type: string
+                                    description: Typ ładunku
+                                    enum: ["FTL", "LTL"]
+                                    example: "FTL"
+                                  client_amount:
+                                    type: number
+                                    description: Kwota klienta
+                                    example: 850.50
+                                    nullable: true
+                                  carrier_amount:
+                                    type: number
+                                    description: Kwota przewoźnika
+                                    example: 750.00
+                                    nullable: true
+                                  carrier_name:
+                                    type: string
+                                    description: Nazwa przewoźnika
+                                    example: "TRANS-POL SP. Z O.O."
+                                  client_price_per_km:
+                                    type: number
+                                    description: Cena klienta za km
+                                    example: 0.95
+                                    nullable: true
+                                  carrier_price_per_km:
+                                    type: number
+                                    description: Cena przewoźnika za km
+                                    example: 0.85
+                                    nullable: true
+                                  route_distance:
+                                    type: number
+                                    description: Dystans trasy (km)
+                                    example: 895.0
+                                    nullable: true
+                                  client_currency:
+                                    type: string
+                                    example: "EUR"
+                                  carrier_currency:
+                                    type: string
+                                    example: "EUR"
                             match_info:
                               type: object
                               description: Informacje o dopasowaniu tras (fuzzy matching)
@@ -1736,6 +1887,50 @@ def get_route_pricing():
         logger.info(f"")
         logger.info(f"✅ Successfully returned pricing data for {start_postal} -> {end_postal}")
 
+        # Oblicz ceny całkowite (dystans × stawka) jeśli mamy dystans z AWS
+        if route_distance_km is not None and route_distance_km > 0:
+            logger.info(f"💰 Calculating total prices with distance: {route_distance_km} km")
+            # TimoCom - ceny całkowite dla różnych typów pojazdów
+            if timocom_30d and 'avg_price_per_km' in timocom_30d:
+                timocom_30d['total_price'] = {}
+                for vehicle_type, rate in timocom_30d['avg_price_per_km'].items():
+                    if rate is not None:
+                        timocom_30d['total_price'][vehicle_type] = round(rate * route_distance_km, 2)
+                    else:
+                        timocom_30d['total_price'][vehicle_type] = None
+                logger.info(f"   ✅ Added total_price to TimoCom: {timocom_30d['total_price']}")
+            
+            # Trans.eu - cena całkowita dla lorry
+            if transeu_30d and 'avg_price_per_km' in transeu_30d:
+                transeu_30d['total_price'] = {}
+                for vehicle_type, rate in transeu_30d['avg_price_per_km'].items():
+                    if rate is not None:
+                        transeu_30d['total_price'][vehicle_type] = round(rate * route_distance_km, 2)
+                    else:
+                        transeu_30d['total_price'][vehicle_type] = None
+            
+            # Historical - ceny całkowite dla FTL i LTL
+            if historical_180d:
+                for cargo_type in ['FTL', 'LTL']:
+                    if cargo_type in historical_180d and 'avg_price_per_km' in historical_180d[cargo_type]:
+                        historical_180d[cargo_type]['total_price'] = {}
+                        
+                        # Client price
+                        if historical_180d[cargo_type]['avg_price_per_km'].get('client') is not None:
+                            historical_180d[cargo_type]['total_price']['client'] = round(
+                                historical_180d[cargo_type]['avg_price_per_km']['client'] * route_distance_km, 2
+                            )
+                        else:
+                            historical_180d[cargo_type]['total_price']['client'] = None
+                        
+                        # Carrier price
+                        if historical_180d[cargo_type]['avg_price_per_km'].get('carrier') is not None:
+                            historical_180d[cargo_type]['total_price']['carrier'] = round(
+                                historical_180d[cargo_type]['avg_price_per_km']['carrier'] * route_distance_km, 2
+                            )
+                        else:
+                            historical_180d[cargo_type]['total_price']['carrier'] = None
+        
         # Przygotuj response ze stawkami średnimi z 30 dni
         response_data = {
             'start_postal_code': start_postal,
