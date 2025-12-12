@@ -886,8 +886,7 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                         AND "clientPricePerKm" IS NOT NULL
                         AND "clientPricePerKm" > 0
                         AND "cargoType" IN ('FTL', 'LTL')  -- Tylko FTL i LTL
-                        AND "carrierName" NOT ILIKE '%motiva%'  -- Pomijamy przewoźnika Motiva
-                        AND "carrierName" NOT ILIKE '%ALB LOGISTICS%'  -- Pomijamy ALB LOGISTICS
+                        AND ("carrierName" IS NULL OR ("carrierName" NOT ILIKE '%%motiva%%' AND "carrierName" NOT ILIKE '%%ALB LOGISTICS%%'))  -- Pomijamy Motiva i ALB LOGISTICS jako przewoźników
                 ),
                 outliers AS (
                     SELECT
@@ -1090,17 +1089,18 @@ def get_historical_orders_pricing(start_region_code: str, end_region_code: str, 
                     AND "clientPricePerKm" IS NOT NULL
                     AND "clientPricePerKm" > 0
                     AND "cargoType" IN ('FTL', 'LTL')
-                    AND "carrierName" NOT ILIKE '%motiva%'
-                    AND "carrierName" NOT ILIKE '%ALB LOGISTICS%'
+                    AND ("carrierName" IS NULL OR ("carrierName" NOT ILIKE '%%motiva%%' AND "carrierName" NOT ILIKE '%%ALB LOGISTICS%%'))
                 ORDER BY "orderDate" DESC;
             """
             
+            logger.info(f"📋 Pobieranie listy zleceń dla: {match_metadata['matched_start']} -> {match_metadata['matched_end']}")
             cur.execute(orders_list_query, {
                 'start_code': match_metadata['matched_start'],
                 'end_code': match_metadata['matched_end'],
                 'days': days
             })
             orders_raw = cur.fetchall()
+            logger.info(f"📋 Pobrano {len(orders_raw)} zleceń z bazy")
             
             # Formatuj listę zleceń
             orders_list = []
