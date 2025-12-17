@@ -188,7 +188,7 @@ def require_api_key(f):
             return jsonify({
                 'success': False,
                 'error': 'Nieprawidłowy API key'
-            }), 403
+            }), 401
         
         logger.info(f"✅ Authorized request from {request.remote_addr}")
         return f(*args, **kwargs)
@@ -800,7 +800,15 @@ def get_route_pricing():
               example: "Wewnętrzny błąd serwera"
     """
     try:
-        data = request.json
+        # Próba parsowania JSON z bardziej szczegółową obsługą błędów
+        try:
+            data = request.get_json(force=True)
+        except Exception as json_error:
+            logger.warning(f"⚠️ JSON parsing error from {request.remote_addr}: {json_error}")
+            return jsonify({
+                'success': False,
+                'error': 'Brak danych JSON w request'
+            }), 400
         
         if not data:
             logger.warning(f"⚠️ Empty JSON from {request.remote_addr}")
